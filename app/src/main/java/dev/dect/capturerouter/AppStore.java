@@ -21,6 +21,11 @@ final class AppStore {
     static final String KEY_LOGS = "logs";
     static final String KEY_MONITORING = "monitoring";
     static final String KEY_PENDING = "pending";
+    static final String KEY_FOREGROUND_PACKAGE = "foreground_package";
+    static final String KEY_FOREGROUND_LABEL = "foreground_label";
+    static final String KEY_FOREGROUND_TIME = "foreground_time";
+    static final String KEY_FILENAME_TEMPLATE = "filename_template";
+    static final String DEFAULT_FILENAME_TEMPLATE = "Screenshot_{date}_{time}_{app}";
     static final String DEFAULT_SCREENSHOT_DIR = "/sdcard/Pictures/Screenshots";
     private static final int MAX_LOGS = 200;
     private static final int MAX_PENDING = 300;
@@ -38,6 +43,37 @@ final class AppStore {
 
     static void setMonitoringEnabled(Context context, boolean enabled) {
         prefs(context).edit().putBoolean(KEY_MONITORING, enabled).apply();
+    }
+
+    static String getFilenameTemplate(Context context) {
+        String value = prefs(context).getString(KEY_FILENAME_TEMPLATE, DEFAULT_FILENAME_TEMPLATE);
+        return ScreenshotNamer.isValidTemplate(value) ? value : DEFAULT_FILENAME_TEMPLATE;
+    }
+
+    static void setFilenameTemplate(Context context, String template) {
+        prefs(context).edit().putString(KEY_FILENAME_TEMPLATE, template).apply();
+    }
+
+    static void setForegroundApp(Context context, String packageName, String label, long time) {
+        prefs(context).edit()
+                .putString(KEY_FOREGROUND_PACKAGE, packageName)
+                .putString(KEY_FOREGROUND_LABEL, label)
+                .putLong(KEY_FOREGROUND_TIME, time)
+                .apply();
+    }
+
+    static ForegroundApp getRecentForegroundApp(Context context, long maxAgeMs) {
+        SharedPreferences prefs = prefs(context);
+        long time = prefs.getLong(KEY_FOREGROUND_TIME, 0);
+        if (time <= 0 || System.currentTimeMillis() - time > maxAgeMs) {
+            return null;
+        }
+        String packageName = prefs.getString(KEY_FOREGROUND_PACKAGE, "");
+        if (packageName == null || packageName.isEmpty()) {
+            return null;
+        }
+        String label = prefs.getString(KEY_FOREGROUND_LABEL, packageName);
+        return new ForegroundApp(packageName, label, time);
     }
 
     static List<Rule> getRules(Context context) {
@@ -147,6 +183,21 @@ final class AppStore {
         for (Rule rule : getRules(context)) {
             if (rule.id.equals(ruleId)) {
                 return rule;
+            }
+        }
+        return null;
+    }
+
+    static Rule findRuleForFilename(Context context, String filename) {
+        String lower = filename == null ? "" : filename.toLowerCase(Locale.US);
+        for (Rule rule : getRules(context)) {
+            if (!rule.enabled) {
+                continue;
+            }
+            for (AppRef app : rule.apps) {
+                if (lower.contains(app.slug().toLowerCase(Locale.US))) {
+                    return rule;
+                }
             }
         }
         return null;
@@ -339,6 +390,16 @@ final class AppStore {
             return packageName;
         }
 
+        String labelForFilename(String filename) {
+            String lower = filename == null ? "" : filename.toLowerCase(Locale.US);
+            for (AppRef app : apps) {
+                if (lower.contains(app.slug().toLowerCase(Locale.US))) {
+                    return app.label;
+                }
+            }
+            return name;
+        }
+
         String modeLabel() {
             return MODE_MANUAL.equals(mode) ? "Queue for review" : "Auto move";
         }
@@ -351,6 +412,22 @@ final class AppStore {
         AppRef(String packageName, String label) {
             this.packageName = packageName;
             this.label = label == null || label.isEmpty() ? packageName : label;
+        }
+
+        String slug() {
+            return ScreenshotNamer.sanitizeLabel(label);
+        }
+    }
+
+    static final class ForegroundApp {
+        final String packageName;
+        final String label;
+        final long time;
+
+        ForegroundApp(String packageName, String label, long time) {
+            this.packageName = packageName;
+            this.label = label == null || label.isEmpty() ? packageName : label;
+            this.time = time;
         }
     }
 

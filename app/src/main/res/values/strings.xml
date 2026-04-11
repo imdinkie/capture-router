@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">CaptureRouter</string>
+    <string name="accessibility_description">Tracks the foreground app so new screenshots can be renamed and routed without root prompts.</string>
 </resources>

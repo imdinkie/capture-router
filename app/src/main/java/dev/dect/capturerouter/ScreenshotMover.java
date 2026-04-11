@@ -6,6 +6,9 @@ import android.media.MediaScannerConnection;
 import android.provider.MediaStore;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
 
 final class ScreenshotMover {
     private ScreenshotMover() {
@@ -14,21 +17,28 @@ final class ScreenshotMover {
     static MoveResult move(Context context, String sourcePath, String destination, boolean nomedia) {
         File source = new File(sourcePath);
         File destinationDir = new File(destination);
-        File target = uniqueTarget(destinationDir, source.getName());
-        StringBuilder command = new StringBuilder();
-        command.append("mkdir -p ").append(RootShell.quote(destinationDir.getAbsolutePath()));
-        if (nomedia) {
-            command.append(" && touch ").append(RootShell.quote(new File(destinationDir, ".nomedia").getAbsolutePath()));
+        if (!source.exists()) {
+            return new MoveResult(false, sourcePath, "Source file no longer exists");
         }
-        command.append(" && mv ").append(RootShell.quote(source.getAbsolutePath()))
-                .append(" ").append(RootShell.quote(target.getAbsolutePath()))
-                .append(" && chmod 0660 ").append(RootShell.quote(target.getAbsolutePath()));
-        RootShell.Result result = RootShell.run(command.toString(), 8000);
-        if (result.ok()) {
+        if (!destinationDir.exists() && !destinationDir.mkdirs()) {
+            return new MoveResult(false, sourcePath, "Could not create destination folder: " + destination);
+        }
+        File target = uniqueTarget(destinationDir, source.getName());
+        try {
+            if (nomedia) {
+                File marker = new File(destinationDir, ".nomedia");
+                if (!marker.exists()) {
+                    marker.createNewFile();
+                }
+            }
+            if (!source.renameTo(target)) {
+                copyThenDelete(source, target);
+            }
             cleanupMediaStore(context, source.getAbsolutePath(), target.getAbsolutePath());
             return new MoveResult(true, target.getAbsolutePath(), "");
+        } catch (IOException e) {
+            return new MoveResult(false, target.getAbsolutePath(), e.getMessage());
         }
-        return new MoveResult(false, target.getAbsolutePath(), result.output);
     }
 
     private static File uniqueTarget(File destinationDir, String fileName) {
@@ -46,6 +56,21 @@ final class ScreenshotMover {
             }
         }
         return new File(destinationDir, base + "-" + System.currentTimeMillis() + ext);
+    }
+
+    private static void copyThenDelete(File source, File target) throws IOException {
+        byte[] buffer = new byte[1024 * 64];
+        try (FileInputStream input = new FileInputStream(source);
+             FileOutputStream output = new FileOutputStream(target)) {
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                output.write(buffer, 0, read);
+            }
+        }
+        if (!source.delete()) {
+            target.delete();
+            throw new IOException("Copied but could not delete original file");
+        }
     }
 
     private static void cleanupMediaStore(Context context, String sourcePath, String targetPath) {

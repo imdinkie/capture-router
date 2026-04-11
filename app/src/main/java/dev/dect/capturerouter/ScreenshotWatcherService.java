@@ -9,12 +9,12 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Environment;
+import android.os.FileObserver;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 
 import java.io.File;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -22,24 +22,18 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class ScreenshotWatcherService extends Service {
     static final String ACTION_STOP = "dev.dect.capturerouter.STOP";
     private static final String CHANNEL_ID = "watcher";
     private static final int NOTIFICATION_ID = 7;
-    private static final long FOREGROUND_POLL_MS = 700;
-    private static final long SCREENSHOT_POLL_MS = 1500;
-    private static final long ATTRIBUTION_WINDOW_MS = 12_000;
-    private static final Pattern ACTIVITY_PACKAGE = Pattern.compile("\\su\\d+\\s+([A-Za-z0-9_.$]+)(?:/|\\s)");
+    private static final long SCREENSHOT_RESCAN_MS = 15_000;
+    private static final long ATTRIBUTION_WINDOW_MS = 20_000;
 
-    private final Set<String> ignoredForegroundPackages = new HashSet<>();
     private final Map<String, Long> knownFiles = new HashMap<>();
-    private final ArrayDeque<ForegroundSample> foregroundSamples = new ArrayDeque<>();
     private HandlerThread workerThread;
     private Handler worker;
+    private FileObserver observer;
     private boolean running;
 
     public static void start(Context context) {
@@ -68,11 +62,6 @@ public class ScreenshotWatcherService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        ignoredForegroundPackages.add(getPackageName());
-        ignoredForegroundPackages.add("android");
-        ignoredForegroundPackages.add("com.android.systemui");
-        ignoredForegroundPackages.add("com.google.android.apps.nexuslauncher");
-        ignoredForegroundPackages.add("com.google.android.permissioncontroller");
         workerThread = new HandlerThread("screenshot-watcher");
         workerThread.start();
         worker = new Handler(workerThread.getLooper());
@@ -94,8 +83,8 @@ public class ScreenshotWatcherService extends Service {
             running = true;
             AppStore.log(this, "INFO", "Monitoring started");
             worker.post(this::primeKnownFiles);
-            worker.post(this::pollForeground);
-            worker.postDelayed(this::pollScreenshots, 700);
+            worker.post(this::startFileObserver);
+            worker.postDelayed(this::rescanScreenshots, 1000);
         }
         return START_STICKY;
     }
@@ -103,6 +92,10 @@ public class ScreenshotWatcherService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        if (observer != null) {
+            observer.stopWatching();
+            observer = null;
+        }
         if (AppStore.isMonitoringEnabled(this)) {
             WatchdogReceiver.schedule(this);
         }
@@ -129,19 +122,22 @@ public class ScreenshotWatcherService extends Service {
         super.onTaskRemoved(rootIntent);
     }
 
-    private void pollForeground() {
-        if (!running) {
-            return;
+    private void startFileObserver() {
+        File dir = screenshotDir();
+        if (!dir.exists()) {
+            dir.mkdirs();
         }
-        String packageName = getForegroundPackage();
-        long now = System.currentTimeMillis();
-        if (packageName != null && !ignoredForegroundPackages.contains(packageName)) {
-            foregroundSamples.addFirst(new ForegroundSample(packageName, now));
-        }
-        while (!foregroundSamples.isEmpty() && now - foregroundSamples.getLast().time > ATTRIBUTION_WINDOW_MS) {
-            foregroundSamples.removeLast();
-        }
-        worker.postDelayed(this::pollForeground, FOREGROUND_POLL_MS);
+        observer = new FileObserver(dir.getAbsolutePath(), FileObserver.CREATE | FileObserver.MOVED_TO | FileObserver.CLOSE_WRITE) {
+            @Override
+            public void onEvent(int event, String path) {
+                if (path == null || !isScreenshotImage(path)) {
+                    return;
+                }
+                File file = new File(screenshotDir(), path);
+                worker.postDelayed(() -> handleCandidate(file), 700);
+            }
+        };
+        observer.startWatching();
     }
 
     private void primeKnownFiles() {
@@ -151,7 +147,7 @@ public class ScreenshotWatcherService extends Service {
         }
     }
 
-    private void pollScreenshots() {
+    private void rescanScreenshots() {
         if (!running) {
             return;
         }
@@ -166,6 +162,8 @@ public class ScreenshotWatcherService extends Service {
                 if (previousModified == null || modified > previousModified) {
                     knownFiles.put(path, modified);
                     handleCandidate(file);
+                } else {
+                    routeAlreadyNamed(file);
                 }
             }
             ArrayList<String> removed = new ArrayList<>();
@@ -180,30 +178,52 @@ public class ScreenshotWatcherService extends Service {
         } catch (Exception e) {
             AppStore.log(this, "ERROR", "Watcher error: " + e.getMessage());
         }
-        worker.postDelayed(this::pollScreenshots, SCREENSHOT_POLL_MS);
+        worker.postDelayed(this::rescanScreenshots, SCREENSHOT_RESCAN_MS);
     }
 
     private void handleCandidate(File file) {
+        if (!file.exists() || !isScreenshotImage(file.getName())) {
+            return;
+        }
         if (!waitUntilStable(file)) {
             AppStore.log(this, "WARN", "Skipped unstable screenshot: " + file.getName());
             return;
         }
-        String packageName = recentForegroundPackage();
-        if (packageName == null) {
-            AppStore.log(this, "INFO", "No recent foreground app for " + file.getName());
+        AppStore.ForegroundApp foreground = AppStore.getRecentForegroundApp(this, ATTRIBUTION_WINDOW_MS);
+        ScreenshotNamer.RenameResult renamed = ScreenshotNamer.ensureNamed(this, file, foreground);
+        if (!renamed.error.isEmpty()) {
+            AppStore.log(this, "WARN", renamed.error);
+        } else if (renamed.renamed) {
+            AppStore.log(this, "RENAMED", file.getName() + " -> " + renamed.file.getName());
+        }
+        knownFiles.remove(file.getAbsolutePath());
+        knownFiles.put(renamed.file.getAbsolutePath(), renamed.file.lastModified());
+        if (foreground == null && renamed.renamed) {
+            AppStore.log(this, "WARN", "No recent foreground app for " + renamed.file.getName());
+        }
+        routeByFilename(renamed.file);
+    }
+
+    private void routeAlreadyNamed(File file) {
+        AppStore.Rule rule = AppStore.findRuleForFilename(this, file.getName());
+        if (rule == null || AppStore.Rule.MODE_MANUAL.equals(rule.mode)) {
             return;
         }
-        AppStore.Rule rule = AppStore.findRule(this, packageName);
+        routeByFilename(file);
+    }
+
+    private void routeByFilename(File file) {
+        AppStore.Rule rule = AppStore.findRuleForFilename(this, file.getName());
         if (rule == null) {
-            AppStore.log(this, "INFO", "No rule for " + packageName + " (" + file.getName() + ")");
+            AppStore.log(this, "INFO", "No filename rule for " + file.getName());
             return;
         }
+        String label = rule.labelForFilename(file.getName());
         if (AppStore.Rule.MODE_MANUAL.equals(rule.mode)) {
-            String label = rule.labelFor(packageName);
             AppStore.addPending(this, new AppStore.PendingShot(
                     "pending-" + file.lastModified() + "-" + file.getName(),
                     file.getAbsolutePath(),
-                    packageName,
+                    "",
                     label,
                     rule.id,
                     rule.name,
@@ -215,23 +235,18 @@ public class ScreenshotWatcherService extends Service {
             updateNotification("Queued for review: " + label);
             return;
         }
-        moveScreenshot(file, rule, packageName);
-    }
-
-    private void moveScreenshot(File source, AppStore.Rule rule, String packageName) {
-        ScreenshotMover.MoveResult result = ScreenshotMover.move(this, source.getAbsolutePath(), rule.destination, rule.nomedia);
+        ScreenshotMover.MoveResult result = ScreenshotMover.move(this, file.getAbsolutePath(), rule.destination, rule.nomedia);
         if (result.ok) {
-            String label = rule.labelFor(packageName);
-            AppStore.log(this, "MOVED", label + ": " + source.getName() + " -> " + rule.destination);
+            knownFiles.remove(file.getAbsolutePath());
+            AppStore.log(this, "MOVED", label + ": " + file.getName() + " -> " + rule.destination);
             updateNotification("Last moved: " + label);
         } else {
-            AppStore.log(this, "ERROR", "Move failed for " + source.getName() + ": " + result.error);
+            AppStore.log(this, "ERROR", "Move failed for " + file.getName() + ": " + result.error);
         }
     }
 
     private List<File> listScreenshots() {
-        File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Screenshots");
-        File[] files = dir.listFiles(file -> file.isFile() && isScreenshotImage(file.getName()));
+        File[] files = screenshotDir().listFiles(file -> file.isFile() && isScreenshotImage(file.getName()));
         if (files == null) {
             return Collections.emptyList();
         }
@@ -240,10 +255,13 @@ public class ScreenshotWatcherService extends Service {
         return result;
     }
 
+    private File screenshotDir() {
+        return new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Screenshots");
+    }
+
     private boolean isScreenshotImage(String name) {
         String lower = name.toLowerCase(Locale.US);
-        return (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp"))
-                && (lower.contains("screenshot") || lower.contains("screen_shot"));
+        return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp");
     }
 
     private boolean waitUntilStable(File file) {
@@ -264,33 +282,6 @@ public class ScreenshotWatcherService extends Service {
         return file.exists() && file.length() > 0;
     }
 
-    private String recentForegroundPackage() {
-        long now = System.currentTimeMillis();
-        for (ForegroundSample sample : foregroundSamples) {
-            if (now - sample.time <= ATTRIBUTION_WINDOW_MS) {
-                return sample.packageName;
-            }
-        }
-        return null;
-    }
-
-    private String getForegroundPackage() {
-        RootShell.Result result = RootShell.run(
-                "dumpsys activity activities | grep -m 6 -E 'topResumedActivity|mResumedActivity|ResumedActivity'",
-                3000
-        );
-        if (!result.ok() || result.output.isEmpty()) {
-            return null;
-        }
-        for (String line : result.output.split("\\n")) {
-            Matcher matcher = ACTIVITY_PACKAGE.matcher(line);
-            if (matcher.find()) {
-                return matcher.group(1);
-            }
-        }
-        return null;
-    }
-
     private void createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel channel = new NotificationChannel(
@@ -298,7 +289,7 @@ public class ScreenshotWatcherService extends Service {
                     "Screenshot monitoring",
                     NotificationManager.IMPORTANCE_LOW
             );
-            channel.setDescription("Moves screenshots into app-specific folders");
+            channel.setDescription("Renames and routes screenshots");
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) {
                 manager.createNotificationChannel(channel);
@@ -339,16 +330,6 @@ public class ScreenshotWatcherService extends Service {
         NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (manager != null) {
             manager.notify(NOTIFICATION_ID, notification(text));
-        }
-    }
-
-    private static final class ForegroundSample {
-        final String packageName;
-        final long time;
-
-        ForegroundSample(String packageName, long time) {
-            this.packageName = packageName;
-            this.time = time;
         }
     }
 }

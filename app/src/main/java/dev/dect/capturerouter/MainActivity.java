@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
@@ -16,8 +17,10 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.Editable;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
@@ -55,7 +58,7 @@ public class MainActivity extends Activity {
 
     private final Handler refreshHandler = new Handler();
     private LinearLayout root;
-    private TextView rootStatus;
+    private TextView accessibilityStatus;
     private TextView storageStatus;
     private TextView watcherStatus;
     private TextView sourceText;
@@ -63,9 +66,6 @@ public class MainActivity extends Activity {
     private LinearLayout pendingList;
     private LinearLayout logsList;
     private Button monitorButton;
-    private boolean rootKnown;
-    private boolean rootOk;
-    private boolean rootCheckInFlight;
 
     private final Runnable refreshRunnable = new Runnable() {
         @Override
@@ -90,7 +90,6 @@ public class MainActivity extends Activity {
             ScreenshotWatcherService.start(this);
         }
         refreshUi();
-        checkRootAsync(false);
         refreshHandler.post(refreshRunnable);
     }
 
@@ -128,10 +127,10 @@ public class MainActivity extends Activity {
         statusCard.addView(sectionTitle("Device readiness"));
         LinearLayout statusRow = row();
         statusRow.setPadding(0, 0, 0, dp(8));
-        rootStatus = statusPill("Root: checking", MUTED);
+        accessibilityStatus = statusPill("Accessibility: needed", MUTED);
         storageStatus = statusPill("Storage: checking", MUTED);
         watcherStatus = statusPill("Watcher: stopped", MUTED);
-        statusRow.addView(rootStatus, weightParams());
+        statusRow.addView(accessibilityStatus, weightParams());
         statusRow.addView(space(dp(8), 1));
         statusRow.addView(storageStatus, weightParams());
         statusRow.addView(space(dp(8), 1));
@@ -145,15 +144,31 @@ public class MainActivity extends Activity {
         monitorButton.setOnClickListener(view -> toggleMonitoring());
         Button allFiles = secondaryButton("All files access");
         allFiles.setOnClickListener(view -> openAllFilesSettings());
-        Button rootCheck = secondaryButton("Check root");
-        rootCheck.setOnClickListener(view -> checkRootNow());
+        Button access = secondaryButton("Accessibility");
+        access.setOnClickListener(view -> openAccessibilitySettings());
         statusButtons.addView(monitorButton, weightParams());
         statusButtons.addView(space(dp(8), 1));
         statusButtons.addView(allFiles, weightParams());
         statusButtons.addView(space(dp(8), 1));
-        statusButtons.addView(rootCheck, weightParams());
+        statusButtons.addView(access, weightParams());
         statusCard.addView(statusButtons);
+        Button battery = secondaryButton("Battery settings");
+        battery.setOnClickListener(view -> openBatterySettings());
+        statusCard.addView(battery);
         root.addView(statusCard);
+
+        LinearLayout settingsCard = card();
+        settingsCard.addView(sectionTitle("Filename settings"));
+        TextView filenameHelp = text("Every new screenshot is renamed before rules run. Rules then match the app part of the filename.", 14, MUTED, Typeface.NORMAL);
+        filenameHelp.setPadding(0, 0, 0, dp(10));
+        settingsCard.addView(filenameHelp);
+        TextView preview = text("Preview: " + ScreenshotNamer.preview(AppStore.getFilenameTemplate(this), "ChatGPT", "com.openai.chatgpt"), 13, ACCENT, Typeface.BOLD);
+        preview.setPadding(0, 0, 0, dp(10));
+        settingsCard.addView(preview);
+        Button filenameButton = secondaryButton("Change filename format");
+        filenameButton.setOnClickListener(view -> showFilenameSettings());
+        settingsCard.addView(filenameButton);
+        root.addView(settingsCard);
 
         LinearLayout rulesCard = card();
         rulesCard.addView(sectionTitle("Routing rules"));
@@ -205,14 +220,17 @@ public class MainActivity extends Activity {
 
     private void refreshUi() {
         boolean allFilesOk = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager();
+        boolean accessibilityOk = isAccessibilityEnabled();
         boolean monitoring = AppStore.isMonitoringEnabled(this);
-        rootStatus.setText(rootKnown ? (rootOk ? "Root: ready" : "Root: needed") : "Root: checking");
-        rootStatus.setTextColor(rootKnown && !rootOk ? DANGER : (rootOk ? ACCENT : MUTED));
+        boolean batteryOk = isIgnoringBatteryOptimizations();
+        accessibilityStatus.setText(accessibilityOk ? "Accessibility: ready" : "Accessibility: needed");
+        accessibilityStatus.setTextColor(accessibilityOk ? ACCENT : DANGER);
         storageStatus.setText(allFilesOk ? "Storage: ready" : "Storage: needed");
         storageStatus.setTextColor(allFilesOk ? ACCENT : DANGER);
         watcherStatus.setText(monitoring ? "Watcher: enabled" : "Watcher: stopped");
         watcherStatus.setTextColor(monitoring ? ACCENT : MUTED);
-        sourceText.setText("Source folder: " + AppStore.DEFAULT_SCREENSHOT_DIR);
+        sourceText.setText("Source folder: " + AppStore.DEFAULT_SCREENSHOT_DIR
+                + "\nBattery: " + (batteryOk ? "unrestricted/allowed" : "optimization may stop background work"));
         monitorButton.setText(monitoring ? "Stop monitoring" : "Start monitoring");
         monitorButton.setBackground(buttonBg(monitoring ? DANGER : ACCENT));
         renderRules();
@@ -235,6 +253,7 @@ public class MainActivity extends Activity {
             item.addView(name);
             item.addView(text(rule.modeLabel() + " • " + rule.apps.size() + " app" + (rule.apps.size() == 1 ? "" : "s"), 13, ACCENT, Typeface.BOLD));
             item.addView(text(appSummary(rule.apps), 13, MUTED, Typeface.NORMAL));
+            item.addView(text("Filename match: " + slugSummary(rule.apps), 13, MUTED, Typeface.NORMAL));
             item.addView(text(rule.destination, 13, MUTED, Typeface.NORMAL));
             LinearLayout actions = row();
             actions.setPadding(0, dp(8), 0, 0);
@@ -350,7 +369,7 @@ public class MainActivity extends Activity {
                     AppStore.log(this, "MOVED", shot.label + ": " + new java.io.File(shot.path).getName() + " -> " + shot.destination);
                 } else {
                     AppStore.log(this, "ERROR", "Queued move failed for " + new java.io.File(shot.path).getName() + ": " + result.error);
-                    showMessage("Move failed", result.error.isEmpty() ? "Root move failed." : result.error);
+                    showMessage("Move failed", result.error.isEmpty() ? "The destination is not writable." : result.error);
                 }
                 refreshUi();
             });
@@ -360,6 +379,11 @@ public class MainActivity extends Activity {
     private void toggleMonitoring() {
         boolean next = !AppStore.isMonitoringEnabled(this);
         if (next) {
+            if (!isAccessibilityEnabled()) {
+                AppStore.log(this, "WARN", "Accessibility is required for app-name screenshot renaming");
+                openAccessibilitySettings();
+                return;
+            }
             if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
                 AppStore.log(this, "WARN", "All files access is required before monitoring");
                 openAllFilesSettings();
@@ -590,6 +614,18 @@ public class MainActivity extends Activity {
         return summary;
     }
 
+    private String slugSummary(List<AppStore.AppRef> apps) {
+        ArrayList<String> names = new ArrayList<>();
+        for (int i = 0; i < apps.size() && i < 3; i++) {
+            names.add(apps.get(i).slug());
+        }
+        String summary = join(names, ", ");
+        if (apps.size() > 3) {
+            summary += " +" + (apps.size() - 3);
+        }
+        return summary;
+    }
+
     private String appSummaryFromInfo(List<AppInfo> apps) {
         ArrayList<String> names = new ArrayList<>();
         for (int i = 0; i < apps.size() && i < 4; i++) {
@@ -628,38 +664,6 @@ public class MainActivity extends Activity {
         return apps;
     }
 
-    private void checkRootNow() {
-        checkRootAsync(true);
-        refreshUi();
-    }
-
-    private void checkRootAsync(boolean showDialog) {
-        if (rootCheckInFlight) {
-            return;
-        }
-        rootCheckInFlight = true;
-        rootStatus.setText("Root: checking");
-        new Thread(() -> {
-            RootShell.Result result = RootShell.run("id", 3000);
-            boolean ok = result.ok() && result.output.contains("uid=0");
-            refreshHandler.post(() -> {
-                rootCheckInFlight = false;
-                rootKnown = true;
-                rootOk = ok;
-                if (showDialog) {
-                    if (ok) {
-                        AppStore.log(this, "INFO", "Root check passed: " + result.output);
-                        showMessage("Root ready", result.output);
-                    } else {
-                        AppStore.log(this, "ERROR", "Root check failed: " + result.output);
-                        showMessage("Root not ready", result.output.isEmpty() ? "Magisk did not grant su." : result.output);
-                    }
-                }
-                refreshUi();
-            });
-        }, "root-check").start();
-    }
-
     private void requestRuntimePermissions() {
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(new String[]{
@@ -681,6 +685,127 @@ public class MainActivity extends Activity {
         } catch (ActivityNotFoundException e) {
             startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
         }
+    }
+
+    private void openAccessibilitySettings() {
+        startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+    }
+
+    private void openBatterySettings() {
+        try {
+            Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            intent.setData(Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (ActivityNotFoundException e) {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+        }
+    }
+
+    private boolean isIgnoringBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT < 23) {
+            return true;
+        }
+        PowerManager manager = (PowerManager) getSystemService(POWER_SERVICE);
+        return manager != null && manager.isIgnoringBatteryOptimizations(getPackageName());
+    }
+
+    private boolean isAccessibilityEnabled() {
+        String enabled = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        if (enabled == null) {
+            return false;
+        }
+        ComponentName expected = new ComponentName(this, ForegroundAppAccessibilityService.class);
+        TextUtils.SimpleStringSplitter splitter = new TextUtils.SimpleStringSplitter(':');
+        splitter.setString(enabled);
+        while (splitter.hasNext()) {
+            ComponentName component = ComponentName.unflattenFromString(splitter.next());
+            if (expected.equals(component)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void showFilenameSettings() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(12);
+        box.setPadding(pad, pad, pad, 0);
+        TextView help = text("Use tokens: {date}, {time}, {app}, {package}, {original}", 13, MUTED, Typeface.NORMAL);
+        box.addView(help);
+        EditText template = new EditText(this);
+        template.setSingleLine(true);
+        template.setText(AppStore.getFilenameTemplate(this));
+        box.addView(template);
+        TextView preview = text("", 13, ACCENT, Typeface.BOLD);
+        preview.setPadding(0, dp(8), 0, dp(8));
+        box.addView(preview);
+        LinearLayout presets = new LinearLayout(this);
+        presets.setOrientation(LinearLayout.VERTICAL);
+        String[] presetValues = new String[]{
+                AppStore.DEFAULT_FILENAME_TEMPLATE,
+                "{app}_Screenshot_{date}_{time}",
+                "Screenshot_{date}_{time}_{app}_{package}",
+                "{date}_{time}_{app}"
+        };
+        for (String preset : presetValues) {
+            Button button = secondaryButton(preset);
+            button.setOnClickListener(view -> template.setText(preset));
+            presets.addView(button);
+        }
+        box.addView(presets);
+        TextWatcher watcher = new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                String value = s.toString();
+                preview.setText(ScreenshotNamer.isValidTemplate(value)
+                        ? "Preview: " + ScreenshotNamer.preview(value, "ChatGPT", "com.openai.chatgpt")
+                        : "Template must include {app} or {package} and no slashes.");
+                preview.setTextColor(ScreenshotNamer.isValidTemplate(value) ? ACCENT : DANGER);
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+            }
+        };
+        template.addTextChangedListener(watcher);
+        watcher.onTextChanged(template.getText(), 0, 0, template.length());
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Filename format")
+                .setView(box)
+                .setPositiveButton("Save", null)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Reset", null)
+                .create();
+        dialog.setOnShowListener(d -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                String value = template.getText().toString().trim();
+                if (!ScreenshotNamer.isValidTemplate(value)) {
+                    preview.setTextColor(DANGER);
+                    preview.setText("Template must include {app} or {package} and no slashes.");
+                    return;
+                }
+                AppStore.setFilenameTemplate(this, value);
+                AppStore.log(this, "INFO", "Filename format set to " + value);
+                dialog.dismiss();
+                rebuildUi();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                template.setText(AppStore.DEFAULT_FILENAME_TEMPLATE);
+            });
+        });
+        dialog.show();
+    }
+
+    private void rebuildUi() {
+        root.removeAllViews();
+        buildUi();
+        refreshUi();
     }
 
     private void showMessage(String title, String message) {
