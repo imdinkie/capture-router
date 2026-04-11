@@ -8,7 +8,6 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
-import android.os.Environment;
 import android.os.FileObserver;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -34,6 +33,7 @@ public class ScreenshotWatcherService extends Service {
     private HandlerThread workerThread;
     private Handler worker;
     private FileObserver observer;
+    private String observedDir;
     private boolean running;
 
     public static void start(Context context) {
@@ -117,7 +117,7 @@ public class ScreenshotWatcherService extends Service {
     public void onTaskRemoved(Intent rootIntent) {
         if (AppStore.isMonitoringEnabled(this)) {
             WatchdogReceiver.schedule(this);
-            AppStore.log(this, "INFO", "Watcher scheduled after app task was dismissed");
+            AppStore.log(this, "INFO", "Monitoring remains enabled after CaptureRouter was dismissed from recents");
         }
         super.onTaskRemoved(rootIntent);
     }
@@ -127,13 +127,14 @@ public class ScreenshotWatcherService extends Service {
         if (!dir.exists()) {
             dir.mkdirs();
         }
+        observedDir = dir.getAbsolutePath();
         observer = new FileObserver(dir.getAbsolutePath(), FileObserver.CREATE | FileObserver.MOVED_TO | FileObserver.CLOSE_WRITE) {
             @Override
             public void onEvent(int event, String path) {
                 if (path == null || !isScreenshotImage(path)) {
                     return;
                 }
-                File file = new File(screenshotDir(), path);
+                File file = new File(observedDir, path);
                 worker.postDelayed(() -> handleCandidate(file), 700);
             }
         };
@@ -232,14 +233,12 @@ public class ScreenshotWatcherService extends Service {
                     System.currentTimeMillis()
             ));
             AppStore.log(this, "QUEUED", label + ": " + file.getName() + " queued for " + rule.name);
-            updateNotification("Queued for review: " + label);
             return;
         }
         ScreenshotMover.MoveResult result = ScreenshotMover.move(this, file.getAbsolutePath(), rule.destination, rule.nomedia);
         if (result.ok) {
             knownFiles.remove(file.getAbsolutePath());
             AppStore.log(this, "MOVED", label + ": " + file.getName() + " -> " + rule.destination);
-            updateNotification("Last moved: " + label);
         } else {
             AppStore.log(this, "ERROR", "Move failed for " + file.getName() + ": " + result.error);
         }
@@ -256,7 +255,7 @@ public class ScreenshotWatcherService extends Service {
     }
 
     private File screenshotDir() {
-        return new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Screenshots");
+        return new File(AppStore.getSourceDir(this));
     }
 
     private boolean isScreenshotImage(String name) {
@@ -321,7 +320,11 @@ public class ScreenshotWatcherService extends Service {
                 .setContentTitle("CaptureRouter")
                 .setContentText(text)
                 .setContentIntent(openIntent)
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .setLocalOnly(true)
                 .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setShowWhen(false)
                 .addAction(R.drawable.ic_launcher, "Stop", stopIntent)
                 .build();
     }

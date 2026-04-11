@@ -25,6 +25,7 @@ final class AppStore {
     static final String KEY_FOREGROUND_LABEL = "foreground_label";
     static final String KEY_FOREGROUND_TIME = "foreground_time";
     static final String KEY_FILENAME_TEMPLATE = "filename_template";
+    static final String KEY_SOURCE_DIR = "source_dir";
     static final String DEFAULT_FILENAME_TEMPLATE = "Screenshot_{date}_{time}_{app}";
     static final String DEFAULT_SCREENSHOT_DIR = "/sdcard/Pictures/Screenshots";
     private static final int MAX_LOGS = 200;
@@ -52,6 +53,19 @@ final class AppStore {
 
     static void setFilenameTemplate(Context context, String template) {
         prefs(context).edit().putString(KEY_FILENAME_TEMPLATE, template).apply();
+    }
+
+    static String getSourceDir(Context context) {
+        String value = prefs(context).getString(KEY_SOURCE_DIR, DEFAULT_SCREENSHOT_DIR);
+        if (value == null || value.trim().isEmpty() || !value.trim().startsWith("/")) {
+            return DEFAULT_SCREENSHOT_DIR;
+        }
+        return value.trim();
+    }
+
+    static void setSourceDir(Context context, String path) {
+        String clean = path == null ? "" : path.trim();
+        prefs(context).edit().putString(KEY_SOURCE_DIR, clean.isEmpty() ? DEFAULT_SCREENSHOT_DIR : clean).apply();
     }
 
     static void setForegroundApp(Context context, String packageName, String label, long time) {
@@ -177,6 +191,18 @@ final class AppStore {
             }
         }
         saveRules(context, kept);
+    }
+
+    static void setRuleEnabled(Context context, String ruleId, boolean enabled) {
+        List<Rule> rules = getRules(context);
+        for (int i = 0; i < rules.size(); i++) {
+            Rule rule = rules.get(i);
+            if (rule.id.equals(ruleId)) {
+                rules.set(i, new Rule(rule.id, rule.name, rule.apps, rule.destination, rule.mode, rule.nomedia, enabled));
+                saveRules(context, rules);
+                return;
+            }
+        }
     }
 
     static Rule findRuleById(Context context, String ruleId) {
