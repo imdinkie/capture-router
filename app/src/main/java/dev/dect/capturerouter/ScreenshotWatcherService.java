@@ -5,17 +5,13 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
-import android.media.MediaScannerConnection;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
-import android.provider.MediaStore;
 
 import java.io.File;
 import java.util.ArrayDeque;
@@ -48,17 +44,25 @@ public class ScreenshotWatcherService extends Service {
 
     public static void start(Context context) {
         Intent intent = new Intent(context, ScreenshotWatcherService.class);
-        if (Build.VERSION.SDK_INT >= 26) {
-            context.startForegroundService(intent);
-        } else {
-            context.startService(intent);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(intent);
+            } else {
+                context.startService(intent);
+            }
+        } catch (RuntimeException e) {
+            AppStore.log(context, "ERROR", "Could not start watcher: " + e.getMessage());
         }
     }
 
     public static void stop(Context context) {
         Intent intent = new Intent(context, ScreenshotWatcherService.class);
         intent.setAction(ACTION_STOP);
-        context.startService(intent);
+        try {
+            context.startService(intent);
+        } catch (RuntimeException e) {
+            AppStore.log(context, "ERROR", "Could not stop watcher: " + e.getMessage());
+        }
     }
 
     @Override
@@ -79,10 +83,12 @@ public class ScreenshotWatcherService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             AppStore.setMonitoringEnabled(this, false);
+            WatchdogReceiver.cancel(this);
             AppStore.log(this, "INFO", "Monitoring stopped");
             stopSelf();
             return START_NOT_STICKY;
         }
+        WatchdogReceiver.schedule(this);
         startForeground(NOTIFICATION_ID, notification("Monitoring screenshots"));
         if (!running) {
             running = true;
@@ -97,6 +103,9 @@ public class ScreenshotWatcherService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        if (AppStore.isMonitoringEnabled(this)) {
+            WatchdogReceiver.schedule(this);
+        }
         if (worker != null) {
             worker.removeCallbacksAndMessages(null);
         }
@@ -109,6 +118,15 @@ public class ScreenshotWatcherService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        if (AppStore.isMonitoringEnabled(this)) {
+            WatchdogReceiver.schedule(this);
+            AppStore.log(this, "INFO", "Watcher scheduled after app task was dismissed");
+        }
+        super.onTaskRemoved(rootIntent);
     }
 
     private void pollForeground() {
@@ -180,28 +198,34 @@ public class ScreenshotWatcherService extends Service {
             AppStore.log(this, "INFO", "No rule for " + packageName + " (" + file.getName() + ")");
             return;
         }
+        if (AppStore.Rule.MODE_MANUAL.equals(rule.mode)) {
+            String label = rule.labelFor(packageName);
+            AppStore.addPending(this, new AppStore.PendingShot(
+                    "pending-" + file.lastModified() + "-" + file.getName(),
+                    file.getAbsolutePath(),
+                    packageName,
+                    label,
+                    rule.id,
+                    rule.name,
+                    rule.destination,
+                    rule.nomedia,
+                    System.currentTimeMillis()
+            ));
+            AppStore.log(this, "QUEUED", label + ": " + file.getName() + " queued for " + rule.name);
+            updateNotification("Queued for review: " + label);
+            return;
+        }
         moveScreenshot(file, rule, packageName);
     }
 
     private void moveScreenshot(File source, AppStore.Rule rule, String packageName) {
-        File destinationDir = new File(rule.destination);
-        File target = uniqueTarget(destinationDir, source.getName());
-        StringBuilder command = new StringBuilder();
-        command.append("mkdir -p ").append(RootShell.quote(destinationDir.getAbsolutePath()));
-        if (rule.nomedia) {
-            command.append(" && touch ").append(RootShell.quote(new File(destinationDir, ".nomedia").getAbsolutePath()));
-        }
-        command.append(" && mv ").append(RootShell.quote(source.getAbsolutePath()))
-                .append(" ").append(RootShell.quote(target.getAbsolutePath()))
-                .append(" && chmod 0660 ").append(RootShell.quote(target.getAbsolutePath()));
-        RootShell.Result result = RootShell.run(command.toString(), 8000);
-        if (result.ok()) {
-            cleanupMediaStore(source.getAbsolutePath(), target.getAbsolutePath());
-            String label = rule.label == null || rule.label.isEmpty() ? packageName : rule.label;
+        ScreenshotMover.MoveResult result = ScreenshotMover.move(this, source.getAbsolutePath(), rule.destination, rule.nomedia);
+        if (result.ok) {
+            String label = rule.labelFor(packageName);
             AppStore.log(this, "MOVED", label + ": " + source.getName() + " -> " + rule.destination);
             updateNotification("Last moved: " + label);
         } else {
-            AppStore.log(this, "ERROR", "Move failed for " + source.getName() + ": " + result.output);
+            AppStore.log(this, "ERROR", "Move failed for " + source.getName() + ": " + result.error);
         }
     }
 
@@ -240,23 +264,6 @@ public class ScreenshotWatcherService extends Service {
         return file.exists() && file.length() > 0;
     }
 
-    private File uniqueTarget(File destinationDir, String fileName) {
-        File target = new File(destinationDir, fileName);
-        if (!target.exists()) {
-            return target;
-        }
-        int dot = fileName.lastIndexOf('.');
-        String base = dot > 0 ? fileName.substring(0, dot) : fileName;
-        String ext = dot > 0 ? fileName.substring(dot) : "";
-        for (int i = 1; i < 1000; i++) {
-            target = new File(destinationDir, base + "-" + i + ext);
-            if (!target.exists()) {
-                return target;
-            }
-        }
-        return new File(destinationDir, base + "-" + System.currentTimeMillis() + ext);
-    }
-
     private String recentForegroundPackage() {
         long now = System.currentTimeMillis();
         for (ForegroundSample sample : foregroundSamples) {
@@ -282,20 +289,6 @@ public class ScreenshotWatcherService extends Service {
             }
         }
         return null;
-    }
-
-    private void cleanupMediaStore(String sourcePath, String targetPath) {
-        try {
-            ContentResolver resolver = getContentResolver();
-            String where = MediaStore.MediaColumns.DATA + "=?";
-            resolver.delete(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, where, new String[]{sourcePath});
-            resolver.delete(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, where, new String[]{targetPath});
-        } catch (Exception ignored) {
-        }
-        try {
-            MediaScannerConnection.scanFile(this, new String[]{sourcePath}, null, null);
-        } catch (Exception ignored) {
-        }
     }
 
     private void createChannel() {

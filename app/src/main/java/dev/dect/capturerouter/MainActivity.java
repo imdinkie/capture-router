@@ -10,6 +10,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -26,8 +27,11 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.graphics.drawable.GradientDrawable;
@@ -35,8 +39,10 @@ import android.graphics.drawable.GradientDrawable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 public class MainActivity extends Activity {
     private static final int BG = Color.rgb(247, 249, 248);
@@ -54,6 +60,7 @@ public class MainActivity extends Activity {
     private TextView watcherStatus;
     private TextView sourceText;
     private LinearLayout rulesList;
+    private LinearLayout pendingList;
     private LinearLayout logsList;
     private Button monitorButton;
     private boolean rootKnown;
@@ -78,6 +85,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (AppStore.isMonitoringEnabled(this)) {
+            WatchdogReceiver.schedule(this);
+            ScreenshotWatcherService.start(this);
+        }
         refreshUi();
         checkRootAsync(false);
         refreshHandler.post(refreshRunnable);
@@ -146,7 +157,7 @@ public class MainActivity extends Activity {
 
         LinearLayout rulesCard = card();
         rulesCard.addView(sectionTitle("Routing rules"));
-        TextView rulesHelp = text("Pick an app, choose a destination, and CaptureRouter will keep matching screenshots out of the camera roll.", 14, MUTED, Typeface.NORMAL);
+        TextView rulesHelp = text("Create one rule for one app or a bundle. Auto rules move immediately; review rules queue screenshots until you move them.", 14, MUTED, Typeface.NORMAL);
         rulesHelp.setPadding(0, 0, 0, dp(12));
         rulesCard.addView(rulesHelp);
         Button addRule = primaryButton("Add routing rule");
@@ -157,6 +168,22 @@ public class MainActivity extends Activity {
         rulesList.setPadding(0, dp(12), 0, 0);
         rulesCard.addView(rulesList);
         root.addView(rulesCard);
+
+        LinearLayout pendingCard = card();
+        LinearLayout pendingHeader = row();
+        pendingHeader.setGravity(Gravity.CENTER_VERTICAL);
+        pendingHeader.addView(sectionTitle("Review queue"), weightParams());
+        Button moveAll = primaryButton("Move all");
+        moveAll.setOnClickListener(view -> moveAllPending());
+        pendingHeader.addView(moveAll);
+        pendingCard.addView(pendingHeader);
+        TextView pendingHelp = text("Review-mode screenshots stay visible in Photos until you move them here.", 14, MUTED, Typeface.NORMAL);
+        pendingHelp.setPadding(0, 0, 0, dp(10));
+        pendingCard.addView(pendingHelp);
+        pendingList = new LinearLayout(this);
+        pendingList.setOrientation(LinearLayout.VERTICAL);
+        pendingCard.addView(pendingList);
+        root.addView(pendingCard);
 
         LinearLayout logsCard = card();
         LinearLayout logHeader = row();
@@ -189,6 +216,7 @@ public class MainActivity extends Activity {
         monitorButton.setText(monitoring ? "Stop monitoring" : "Start monitoring");
         monitorButton.setBackground(buttonBg(monitoring ? DANGER : ACCENT));
         renderRules();
+        renderPending();
         renderLogs();
     }
 
@@ -202,19 +230,21 @@ public class MainActivity extends Activity {
         }
         for (AppStore.Rule rule : rules) {
             LinearLayout item = itemBox();
-            TextView name = text(rule.label + "\n" + rule.packageName, 15, INK, Typeface.BOLD);
+            TextView name = text(rule.name, 16, INK, Typeface.BOLD);
             name.setPadding(0, 0, 0, dp(5));
             item.addView(name);
+            item.addView(text(rule.modeLabel() + " • " + rule.apps.size() + " app" + (rule.apps.size() == 1 ? "" : "s"), 13, ACCENT, Typeface.BOLD));
+            item.addView(text(appSummary(rule.apps), 13, MUTED, Typeface.NORMAL));
             item.addView(text(rule.destination, 13, MUTED, Typeface.NORMAL));
             LinearLayout actions = row();
             actions.setPadding(0, dp(8), 0, 0);
             Button edit = secondaryButton("Edit");
-            edit.setOnClickListener(view -> showRuleEditor(rule.packageName, rule.label, rule.destination, rule.nomedia));
+            edit.setOnClickListener(view -> showRuleEditor(rule.id, toAppInfo(rule.apps), rule.name, rule.destination, rule.mode, rule.nomedia));
             Button remove = secondaryButton("Remove");
             remove.setTextColor(DANGER);
             remove.setOnClickListener(view -> {
-                AppStore.removeRule(this, rule.packageName);
-                AppStore.log(this, "INFO", "Removed rule for " + rule.packageName);
+                AppStore.removeRule(this, rule.id);
+                AppStore.log(this, "INFO", "Removed rule " + rule.name);
                 refreshUi();
             });
             actions.addView(edit);
@@ -244,6 +274,89 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void renderPending() {
+        if (pendingList == null) {
+            return;
+        }
+        AppStore.pruneMissingPending(this);
+        pendingList.removeAllViews();
+        List<AppStore.PendingShot> pending = AppStore.getPending(this);
+        if (pending.isEmpty()) {
+            pendingList.addView(text("No screenshots waiting for review.", 14, MUTED, Typeface.NORMAL));
+            return;
+        }
+        for (AppStore.PendingShot shot : pending) {
+            LinearLayout item = itemBox();
+            item.addView(text(shot.label, 15, INK, Typeface.BOLD));
+            item.addView(text(shot.ruleName + " • " + AppStore.formatTime(shot.time), 13, ACCENT, Typeface.BOLD));
+            item.addView(text(new java.io.File(shot.path).getName(), 13, MUTED, Typeface.NORMAL));
+            LinearLayout actions = row();
+            actions.setPadding(0, dp(8), 0, 0);
+            Button move = primaryButton("Move now");
+            move.setOnClickListener(view -> movePending(shot));
+            Button forget = secondaryButton("Forget");
+            forget.setOnClickListener(view -> {
+                AppStore.removePending(this, shot.id);
+                AppStore.log(this, "INFO", "Forgot queued screenshot " + new java.io.File(shot.path).getName());
+                refreshUi();
+            });
+            actions.addView(move);
+            actions.addView(space(dp(8), 1));
+            actions.addView(forget);
+            item.addView(actions);
+            pendingList.addView(item);
+        }
+    }
+
+    private void moveAllPending() {
+        List<AppStore.PendingShot> pending = AppStore.getPending(this);
+        if (pending.isEmpty()) {
+            showMessage("Nothing queued", "There are no review-mode screenshots waiting to move.");
+            return;
+        }
+        new Thread(() -> {
+            int moved = 0;
+            int failed = 0;
+            for (AppStore.PendingShot shot : pending) {
+                if (!new java.io.File(shot.path).exists()) {
+                    AppStore.removePending(this, shot.id);
+                    continue;
+                }
+                ScreenshotMover.MoveResult result = ScreenshotMover.move(this, shot.path, shot.destination, shot.nomedia);
+                if (result.ok) {
+                    moved++;
+                    AppStore.removePending(this, shot.id);
+                    AppStore.log(this, "MOVED", shot.label + ": " + new java.io.File(shot.path).getName() + " -> " + shot.destination);
+                } else {
+                    failed++;
+                    AppStore.log(this, "ERROR", "Queued move failed for " + new java.io.File(shot.path).getName() + ": " + result.error);
+                }
+            }
+            int finalMoved = moved;
+            int finalFailed = failed;
+            refreshHandler.post(() -> {
+                refreshUi();
+                showMessage("Queue processed", finalMoved + " moved, " + finalFailed + " failed.");
+            });
+        }, "move-pending").start();
+    }
+
+    private void movePending(AppStore.PendingShot shot) {
+        new Thread(() -> {
+            ScreenshotMover.MoveResult result = ScreenshotMover.move(this, shot.path, shot.destination, shot.nomedia);
+            refreshHandler.post(() -> {
+                if (result.ok) {
+                    AppStore.removePending(this, shot.id);
+                    AppStore.log(this, "MOVED", shot.label + ": " + new java.io.File(shot.path).getName() + " -> " + shot.destination);
+                } else {
+                    AppStore.log(this, "ERROR", "Queued move failed for " + new java.io.File(shot.path).getName() + ": " + result.error);
+                    showMessage("Move failed", result.error.isEmpty() ? "Root move failed." : result.error);
+                }
+                refreshUi();
+            });
+        }, "move-one-pending").start();
+    }
+
     private void toggleMonitoring() {
         boolean next = !AppStore.isMonitoringEnabled(this);
         if (next) {
@@ -253,8 +366,10 @@ public class MainActivity extends Activity {
                 return;
             }
             AppStore.setMonitoringEnabled(this, true);
+            WatchdogReceiver.schedule(this);
             ScreenshotWatcherService.start(this);
         } else {
+            WatchdogReceiver.cancel(this);
             ScreenshotWatcherService.stop(this);
         }
         refreshUi();
@@ -266,31 +381,48 @@ public class MainActivity extends Activity {
             showMessage("No apps found", "The package picker could not load installed applications.");
             return;
         }
+        showAppPicker(apps, new ArrayList<>());
+    }
+
+    private void showAppPicker(ArrayList<AppInfo> apps, List<AppInfo> initiallySelected) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         int pad = dp(12);
         box.setPadding(pad, pad, pad, 0);
         EditText search = new EditText(this);
         search.setSingleLine(true);
-        search.setHint("Search apps");
+        search.setHint("Search by app or package");
         box.addView(search);
+        TextView selectedCount = text("No apps selected", 13, MUTED, Typeface.BOLD);
+        selectedCount.setPadding(0, dp(8), 0, dp(8));
+        box.addView(selectedCount);
         ListView listView = new ListView(this);
         box.addView(listView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(420)
         ));
         ArrayList<AppInfo> filtered = new ArrayList<>(apps);
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, labels(filtered));
+        HashSet<String> selectedPackages = new HashSet<>();
+        for (AppInfo app : initiallySelected) {
+            selectedPackages.add(app.packageName);
+        }
+        AppPickerAdapter adapter = new AppPickerAdapter(this, filtered, selectedPackages);
         listView.setAdapter(adapter);
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("Choose app")
+                .setTitle("Select apps")
                 .setView(box)
+                .setPositiveButton("Continue", null)
                 .setNegativeButton("Cancel", null)
                 .create();
         listView.setOnItemClickListener((parent, view, position, id) -> {
             AppInfo app = filtered.get(position);
-            dialog.dismiss();
-            showRuleEditor(app.packageName, app.label, AppStore.defaultDestination(app.label, app.packageName), true);
+            if (selectedPackages.contains(app.packageName)) {
+                selectedPackages.remove(app.packageName);
+            } else {
+                selectedPackages.add(app.packageName);
+            }
+            selectedCount.setText(selectionLabel(selectedPackages.size()));
+            adapter.notifyDataSetChanged();
         });
         search.addTextChangedListener(new TextWatcher() {
             @Override
@@ -307,8 +439,7 @@ public class MainActivity extends Activity {
                         filtered.add(app);
                     }
                 }
-                adapter.clear();
-                adapter.addAll(labels(filtered));
+                adapter.notifyDataSetChanged();
             }
 
             @Override
@@ -316,6 +447,30 @@ public class MainActivity extends Activity {
             }
         });
         dialog.setOnShowListener(d -> {
+            selectedCount.setText(selectionLabel(selectedPackages.size()));
+            Button positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            positive.setTextColor(ACCENT);
+            positive.setOnClickListener(view -> {
+                ArrayList<AppInfo> selectedApps = new ArrayList<>();
+                for (AppInfo app : apps) {
+                    if (selectedPackages.contains(app.packageName)) {
+                        selectedApps.add(app);
+                    }
+                }
+                if (selectedApps.isEmpty()) {
+                    selectedCount.setTextColor(DANGER);
+                    selectedCount.setText("Select at least one app");
+                    return;
+                }
+                dialog.dismiss();
+                String defaultName = selectedApps.size() == 1
+                        ? selectedApps.get(0).label
+                        : selectedApps.get(0).label + " +" + (selectedApps.size() - 1);
+                showRuleEditor(AppStore.newRuleId(), selectedApps, defaultName,
+                        AppStore.defaultDestination(defaultName, selectedApps.get(0).packageName),
+                        AppStore.Rule.MODE_AUTO,
+                        true);
+            });
             search.requestFocus();
             search.postDelayed(() -> {
                 InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
@@ -327,13 +482,18 @@ public class MainActivity extends Activity {
         dialog.show();
     }
 
-    private void showRuleEditor(String packageName, String label, String destination, boolean nomedia) {
+    private void showRuleEditor(String ruleId, List<AppInfo> apps, String ruleName, String destination, String mode, boolean nomedia) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         int pad = dp(12);
         box.setPadding(pad, pad, pad, 0);
-        TextView packageLine = text(label + "\n" + packageName, 14, MUTED, Typeface.NORMAL);
-        box.addView(packageLine);
+        TextView appsLine = text(appSummaryFromInfo(apps), 14, MUTED, Typeface.NORMAL);
+        box.addView(appsLine);
+        EditText name = new EditText(this);
+        name.setSingleLine(true);
+        name.setHint("Rule name");
+        name.setText(ruleName);
+        box.addView(name);
         EditText folder = new EditText(this);
         folder.setSingleLine(false);
         folder.setMinLines(2);
@@ -341,6 +501,20 @@ public class MainActivity extends Activity {
         folder.setSelectAllOnFocus(false);
         folder.setHint("/sdcard/Pictures/.CaptureRouter/App");
         box.addView(folder);
+        RadioGroup modeGroup = new RadioGroup(this);
+        modeGroup.setOrientation(RadioGroup.VERTICAL);
+        RadioButton auto = new RadioButton(this);
+        auto.setText("Auto move immediately");
+        auto.setTextColor(INK);
+        RadioButton manual = new RadioButton(this);
+        manual.setText("Queue for review");
+        manual.setTextColor(INK);
+        auto.setId(101);
+        manual.setId(102);
+        modeGroup.addView(auto);
+        modeGroup.addView(manual);
+        modeGroup.check(AppStore.Rule.MODE_MANUAL.equals(mode) ? 102 : 101);
+        box.addView(modeGroup);
         CheckBox nomediaBox = new CheckBox(this);
         nomediaBox.setText("Create .nomedia in this folder");
         nomediaBox.setTextColor(INK);
@@ -351,12 +525,24 @@ public class MainActivity extends Activity {
                 .setView(box)
                 .setPositiveButton("Save", (dialog, which) -> {
                     String path = folder.getText().toString().trim();
+                    String cleanName = name.getText().toString().trim();
                     if (path.isEmpty()) {
                         showMessage("Folder required", "Enter an absolute folder path.");
                         return;
                     }
-                    AppStore.addOrReplaceRule(this, new AppStore.Rule(packageName, label, path, nomediaBox.isChecked(), true));
-                    AppStore.log(this, "INFO", "Saved rule for " + packageName + " -> " + path);
+                    if (cleanName.isEmpty()) {
+                        cleanName = apps.size() == 1 ? apps.get(0).label : "App bundle";
+                    }
+                    ArrayList<AppStore.AppRef> refs = new ArrayList<>();
+                    for (AppInfo app : apps) {
+                        refs.add(new AppStore.AppRef(app.packageName, app.label));
+                    }
+                    String selectedMode = modeGroup.getCheckedRadioButtonId() == 102
+                            ? AppStore.Rule.MODE_MANUAL
+                            : AppStore.Rule.MODE_AUTO;
+                    AppStore.addOrReplaceRule(this, new AppStore.Rule(ruleId, cleanName, refs, path, selectedMode, nomediaBox.isChecked(), true));
+                    WatchdogReceiver.schedule(this);
+                    AppStore.log(this, "INFO", "Saved " + cleanName + " as " + (AppStore.Rule.MODE_MANUAL.equals(selectedMode) ? "review queue" : "auto move"));
                     refreshUi();
                 })
                 .setNegativeButton("Cancel", null)
@@ -376,18 +562,70 @@ public class MainActivity extends Activity {
                 continue;
             }
             String label = packageManager.getApplicationLabel(info).toString();
-            apps.add(new AppInfo(label, info.packageName));
+            apps.add(new AppInfo(label, info.packageName, packageManager.getApplicationIcon(info)));
         }
         Collections.sort(apps, Comparator.comparing(app -> app.label.toLowerCase(Locale.US)));
         return apps;
     }
 
-    private ArrayList<String> labels(List<AppInfo> apps) {
-        ArrayList<String> labels = new ArrayList<>();
-        for (AppInfo app : apps) {
-            labels.add(app.label + "\n" + app.packageName);
+    private String selectionLabel(int count) {
+        if (count == 0) {
+            return "No apps selected";
         }
-        return labels;
+        if (count == 1) {
+            return "1 app selected";
+        }
+        return count + " apps selected";
+    }
+
+    private String appSummary(List<AppStore.AppRef> apps) {
+        ArrayList<String> names = new ArrayList<>();
+        for (int i = 0; i < apps.size() && i < 3; i++) {
+            names.add(apps.get(i).label);
+        }
+        String summary = join(names, ", ");
+        if (apps.size() > 3) {
+            summary += " +" + (apps.size() - 3);
+        }
+        return summary;
+    }
+
+    private String appSummaryFromInfo(List<AppInfo> apps) {
+        ArrayList<String> names = new ArrayList<>();
+        for (int i = 0; i < apps.size() && i < 4; i++) {
+            names.add(apps.get(i).label);
+        }
+        String summary = join(names, ", ");
+        if (apps.size() > 4) {
+            summary += " +" + (apps.size() - 4);
+        }
+        return summary;
+    }
+
+    private String join(List<String> values, String separator) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                builder.append(separator);
+            }
+            builder.append(values.get(i));
+        }
+        return builder.toString();
+    }
+
+    private ArrayList<AppInfo> toAppInfo(List<AppStore.AppRef> refs) {
+        PackageManager packageManager = getPackageManager();
+        ArrayList<AppInfo> apps = new ArrayList<>();
+        for (AppStore.AppRef ref : refs) {
+            Drawable icon;
+            try {
+                icon = packageManager.getApplicationIcon(ref.packageName);
+            } catch (PackageManager.NameNotFoundException e) {
+                icon = getDrawable(R.drawable.ic_launcher);
+            }
+            apps.add(new AppInfo(ref.label, ref.packageName, icon));
+        }
+        return apps;
     }
 
     private void checkRootNow() {
@@ -609,10 +847,60 @@ public class MainActivity extends Activity {
     private static final class AppInfo {
         final String label;
         final String packageName;
+        final Drawable icon;
 
-        AppInfo(String label, String packageName) {
+        AppInfo(String label, String packageName, Drawable icon) {
             this.label = label == null ? packageName : label;
             this.packageName = packageName;
+            this.icon = icon;
+        }
+    }
+
+    private final class AppPickerAdapter extends ArrayAdapter<AppInfo> {
+        private final List<AppInfo> apps;
+        private final Set<String> selectedPackages;
+
+        AppPickerAdapter(Context context, List<AppInfo> apps, Set<String> selectedPackages) {
+            super(context, 0, apps);
+            this.apps = apps;
+            this.selectedPackages = selectedPackages;
+        }
+
+        @Override
+        public int getCount() {
+            return apps.size();
+        }
+
+        @Override
+        public AppInfo getItem(int position) {
+            return apps.get(position);
+        }
+
+        @Override
+        public View getView(int position, View convertView, ViewGroup parent) {
+            AppInfo app = getItem(position);
+            LinearLayout row = new LinearLayout(MainActivity.this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(10), dp(8), dp(10), dp(8));
+            ImageView icon = new ImageView(MainActivity.this);
+            icon.setImageDrawable(app.icon);
+            LinearLayout.LayoutParams iconParams = new LinearLayout.LayoutParams(dp(40), dp(40));
+            row.addView(icon, iconParams);
+            LinearLayout texts = new LinearLayout(MainActivity.this);
+            texts.setOrientation(LinearLayout.VERTICAL);
+            texts.setPadding(dp(12), 0, dp(8), 0);
+            TextView label = text(app.label, 15, INK, Typeface.BOLD);
+            TextView pkg = text(app.packageName, 12, MUTED, Typeface.NORMAL);
+            texts.addView(label);
+            texts.addView(pkg);
+            row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+            CheckBox checkBox = new CheckBox(MainActivity.this);
+            checkBox.setChecked(selectedPackages.contains(app.packageName));
+            checkBox.setClickable(false);
+            checkBox.setFocusable(false);
+            row.addView(checkBox);
+            return row;
         }
     }
 }
