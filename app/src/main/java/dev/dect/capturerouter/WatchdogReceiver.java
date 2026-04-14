@@ -16,6 +16,7 @@ public class WatchdogReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         if (AppStore.isMonitoringEnabled(context)) {
+            AppStore.log(context, "INFO", "WATCHDOG", "Watchdog fired");
             ScreenshotWatcherService.start(context);
             schedule(context);
         }
@@ -24,6 +25,7 @@ public class WatchdogReceiver extends BroadcastReceiver {
     static void schedule(Context context) {
         AlarmManager manager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
         if (manager == null) {
+            AppStore.log(context, "WARN", "WATCHDOG", "AlarmManager unavailable");
             return;
         }
         PendingIntent intent = pendingIntent(context);
@@ -33,6 +35,7 @@ public class WatchdogReceiver extends BroadcastReceiver {
         } else {
             manager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, when, intent);
         }
+        AppStore.log(context, "INFO", "WATCHDOG", "Watchdog scheduled in " + WATCHDOG_INTERVAL_MS + "ms");
     }
 
     static void cancel(Context context) {

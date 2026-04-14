@@ -1,7 +1,10 @@
 package dev.dect.capturerouter;
 
+import android.content.ContentValues;
 import android.content.Context;
 import android.media.MediaScannerConnection;
+import android.net.Uri;
+import android.provider.MediaStore;
 
 import java.io.File;
 import java.text.SimpleDateFormat;
@@ -18,6 +21,10 @@ final class ScreenshotNamer {
     }
 
     static RenameResult ensureNamed(Context context, File source, AppStore.ForegroundApp foreground) {
+        return ensureNamed(context, source, foreground, null);
+    }
+
+    static RenameResult ensureNamed(Context context, File source, AppStore.ForegroundApp foreground, Uri mediaUri) {
         String originalName = source.getName();
         String ext = extension(originalName);
         String originalBase = originalName.substring(0, originalName.length() - ext.length());
@@ -39,7 +46,7 @@ final class ScreenshotNamer {
         if (source.equals(target)) {
             return new RenameResult(source, appLabel, packageName, appSlug, false, "");
         }
-        if (source.renameTo(target)) {
+        if (renameWithMediaStore(context, mediaUri, source, target) || source.renameTo(target)) {
             scan(context, source.getAbsolutePath(), target.getAbsolutePath());
             return new RenameResult(target, appLabel, packageName, appSlug, true, "");
         }
@@ -123,6 +130,26 @@ final class ScreenshotNamer {
             }
         }
         return new File(dir, base + "_" + System.currentTimeMillis() + ext);
+    }
+
+    private static boolean renameWithMediaStore(Context context, Uri mediaUri, File source, File target) {
+        if (mediaUri == null || android.os.Build.VERSION.SDK_INT < 29) {
+            return false;
+        }
+        try {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, target.getName());
+            int rows = context.getContentResolver().update(mediaUri, values, null, null);
+            if (rows < 1) {
+                return false;
+            }
+            if (target.exists()) {
+                return true;
+            }
+            return !source.exists();
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static String extension(String name) {

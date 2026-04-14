@@ -5,13 +5,19 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
+import android.database.ContentObserver;
+import android.database.Cursor;
+import android.net.Uri;
 import android.os.Build;
 import android.os.FileObserver;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.provider.MediaStore;
+import android.content.pm.ServiceInfo;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -26,13 +32,17 @@ public class ScreenshotWatcherService extends Service {
     static final String ACTION_STOP = "dev.dect.capturerouter.STOP";
     private static final String CHANNEL_ID = "watcher";
     private static final int NOTIFICATION_ID = 7;
-    private static final long SCREENSHOT_RESCAN_MS = 15_000;
+    private static final long SCREENSHOT_RESCAN_MS = 30_000;
     private static final long ATTRIBUTION_WINDOW_MS = 20_000;
+    private static final long MEDIASTORE_LOOKBACK_MS = 30 * 60 * 1000L;
 
     private final Map<String, Long> knownFiles = new HashMap<>();
+    private final HashSet<String> queuedPaths = new HashSet<>();
+    private final Runnable mediaStoreScanRunnable = this::scanRecentMediaStore;
     private HandlerThread workerThread;
     private Handler worker;
     private FileObserver observer;
+    private ContentObserver mediaObserver;
     private String observedDir;
     private boolean running;
 
@@ -45,7 +55,7 @@ public class ScreenshotWatcherService extends Service {
                 context.startService(intent);
             }
         } catch (RuntimeException e) {
-            AppStore.log(context, "ERROR", "Could not start watcher: " + e.getMessage());
+            AppStore.log(context, "ERROR", "SERVICE", "Could not start watcher: " + e.getMessage());
         }
     }
 
@@ -55,7 +65,7 @@ public class ScreenshotWatcherService extends Service {
         try {
             context.startService(intent);
         } catch (RuntimeException e) {
-            AppStore.log(context, "ERROR", "Could not stop watcher: " + e.getMessage());
+            AppStore.log(context, "ERROR", "SERVICE", "Could not stop watcher: " + e.getMessage());
         }
     }
 
@@ -73,17 +83,19 @@ public class ScreenshotWatcherService extends Service {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             AppStore.setMonitoringEnabled(this, false);
             WatchdogReceiver.cancel(this);
-            AppStore.log(this, "INFO", "Monitoring stopped");
+            AppStore.log(this, "INFO", "SERVICE", "Monitoring stopped");
             stopSelf();
             return START_NOT_STICKY;
         }
         WatchdogReceiver.schedule(this);
-        startForeground(NOTIFICATION_ID, notification("Monitoring screenshots"));
+        promoteToForeground("Monitoring screenshots");
         if (!running) {
             running = true;
-            AppStore.log(this, "INFO", "Monitoring started");
+            AppStore.log(this, "INFO", "SERVICE", "Monitoring started source=" + AppStore.getSourceDir(this));
             worker.post(this::primeKnownFiles);
             worker.post(this::startFileObserver);
+            worker.post(this::startMediaObserver);
+            worker.post(mediaStoreScanRunnable);
             worker.postDelayed(this::rescanScreenshots, 1000);
         }
         return START_STICKY;
@@ -95,6 +107,13 @@ public class ScreenshotWatcherService extends Service {
         if (observer != null) {
             observer.stopWatching();
             observer = null;
+        }
+        if (mediaObserver != null) {
+            try {
+                getContentResolver().unregisterContentObserver(mediaObserver);
+            } catch (RuntimeException ignored) {
+            }
+            mediaObserver = null;
         }
         if (AppStore.isMonitoringEnabled(this)) {
             WatchdogReceiver.schedule(this);
@@ -117,9 +136,18 @@ public class ScreenshotWatcherService extends Service {
     public void onTaskRemoved(Intent rootIntent) {
         if (AppStore.isMonitoringEnabled(this)) {
             WatchdogReceiver.schedule(this);
-            AppStore.log(this, "INFO", "Monitoring remains enabled after CaptureRouter was dismissed from recents");
+            AppStore.log(this, "INFO", "SERVICE", "Monitoring remains enabled after CaptureRouter was dismissed from recents");
         }
         super.onTaskRemoved(rootIntent);
+    }
+
+    @Override
+    public void onTimeout(int type, int reason) {
+        AppStore.log(this, "ERROR", "SERVICE", "Foreground service timeout type=" + type + " reason=" + reason);
+        if (AppStore.isMonitoringEnabled(this)) {
+            WatchdogReceiver.schedule(this);
+        }
+        stopSelf();
     }
 
     private void startFileObserver() {
@@ -131,14 +159,41 @@ public class ScreenshotWatcherService extends Service {
         observer = new FileObserver(dir.getAbsolutePath(), FileObserver.CREATE | FileObserver.MOVED_TO | FileObserver.CLOSE_WRITE) {
             @Override
             public void onEvent(int event, String path) {
-                if (path == null || !isScreenshotImage(path)) {
+                if (path == null || !isScreenshotImage(path) || !isOriginalSystemScreenshot(path)) {
                     return;
                 }
                 File file = new File(observedDir, path);
-                worker.postDelayed(() -> handleCandidate(file), 700);
+                AppStore.log(ScreenshotWatcherService.this, "INFO", "OBSERVER", "Filesystem event=" + event + " file=" + path);
+                queueCandidate(file, "file-observer", null);
             }
         };
         observer.startWatching();
+        AppStore.log(this, "INFO", "OBSERVER", "FileObserver watching " + observedDir);
+    }
+
+    private void startMediaObserver() {
+        if (mediaObserver != null) {
+            return;
+        }
+        mediaObserver = new ContentObserver(worker) {
+            @Override
+            public void onChange(boolean selfChange, Uri uri) {
+                AppStore.log(ScreenshotWatcherService.this, "INFO", "MEDIASTORE", "MediaStore changed uri=" + uri);
+                worker.removeCallbacks(mediaStoreScanRunnable);
+                worker.postDelayed(mediaStoreScanRunnable, 500);
+            }
+
+            @Override
+            public void onChange(boolean selfChange) {
+                onChange(selfChange, null);
+            }
+        };
+        try {
+            getContentResolver().registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, mediaObserver);
+            AppStore.log(this, "INFO", "MEDIASTORE", "ContentObserver registered");
+        } catch (RuntimeException e) {
+            AppStore.log(this, "ERROR", "MEDIASTORE", "ContentObserver registration failed: " + e.getMessage());
+        }
     }
 
     private void primeKnownFiles() {
@@ -162,7 +217,7 @@ public class ScreenshotWatcherService extends Service {
                 long modified = file.lastModified();
                 if (previousModified == null || modified > previousModified) {
                     knownFiles.put(path, modified);
-                    handleCandidate(file);
+                    queueCandidate(file, "rescan", null);
                 } else {
                     routeAlreadyNamed(file);
                 }
@@ -177,30 +232,73 @@ public class ScreenshotWatcherService extends Service {
                 knownFiles.remove(path);
             }
         } catch (Exception e) {
-            AppStore.log(this, "ERROR", "Watcher error: " + e.getMessage());
+            AppStore.log(this, "ERROR", "OBSERVER", "Watcher error: " + e.getMessage());
         }
+        scanRecentMediaStore();
         worker.postDelayed(this::rescanScreenshots, SCREENSHOT_RESCAN_MS);
     }
 
-    private void handleCandidate(File file) {
+    private void queueCandidate(File file, String trigger, String processedKey) {
+        String path = file.getAbsolutePath();
+        if (!queuedPaths.add(path)) {
+            return;
+        }
+        worker.postDelayed(() -> {
+            try {
+                handleCandidate(file, null, trigger, processedKey);
+            } finally {
+                queuedPaths.remove(path);
+            }
+        }, 700);
+    }
+
+    private void handleCandidate(File file, Uri mediaUri, String trigger, String processedKey) {
+        if (processedKey != null && AppStore.hasProcessedScreenshot(this, processedKey)) {
+            return;
+        }
         if (!file.exists() || !isScreenshotImage(file.getName())) {
+            if (processedKey != null) {
+                AppStore.rememberProcessedScreenshot(this, processedKey);
+            }
+            if (!"mediastore".equals(trigger)) {
+                AppStore.log(this, "WARN", "RENAME", "Candidate missing trigger=" + trigger + " file=" + file.getAbsolutePath());
+            }
             return;
         }
         if (!waitUntilStable(file)) {
-            AppStore.log(this, "WARN", "Skipped unstable screenshot: " + file.getName());
+            AppStore.log(this, "WARN", "RENAME", "Skipped unstable screenshot trigger=" + trigger + " file=" + file.getName());
+            return;
+        }
+        if (processedKey == null || processedKey.startsWith("file:")) {
+            processedKey = processedKeyForFile(file);
+        }
+        if (AppStore.hasProcessedScreenshot(this, processedKey)) {
             return;
         }
         AppStore.ForegroundApp foreground = AppStore.getRecentForegroundApp(this, ATTRIBUTION_WINDOW_MS);
-        ScreenshotNamer.RenameResult renamed = ScreenshotNamer.ensureNamed(this, file, foreground);
+        if (foreground == null && isOriginalSystemScreenshot(file.getName())
+                && System.currentTimeMillis() - file.lastModified() > ATTRIBUTION_WINDOW_MS) {
+            AppStore.log(this, "WARN", "ATTRIBUTION", "Left stale screenshot unchanged because no recent foreground app was available trigger="
+                    + trigger + " file=" + file.getName());
+            AppStore.rememberProcessedScreenshot(this, processedKey);
+            return;
+        }
+        ScreenshotNamer.RenameResult renamed = ScreenshotNamer.ensureNamed(this, file, foreground, mediaUri);
         if (!renamed.error.isEmpty()) {
-            AppStore.log(this, "WARN", renamed.error);
+            AppStore.log(this, "WARN", "RENAME", renamed.error + " trigger=" + trigger + " fg=" + AppStore.foregroundSummary(this));
         } else if (renamed.renamed) {
-            AppStore.log(this, "RENAMED", file.getName() + " -> " + renamed.file.getName());
+            String confidence = foreground == null ? "NONE" : foreground.confidence;
+            String source = foreground == null ? "" : foreground.source;
+            AppStore.log(this, "RENAMED", "RENAME", file.getName() + " -> " + renamed.file.getName()
+                    + " trigger=" + trigger + " app=" + renamed.packageName + " confidence=" + confidence + " source=" + source);
         }
         knownFiles.remove(file.getAbsolutePath());
         knownFiles.put(renamed.file.getAbsolutePath(), renamed.file.lastModified());
+        if (processedKey != null) {
+            AppStore.rememberProcessedScreenshot(this, processedKey);
+        }
         if (foreground == null && renamed.renamed) {
-            AppStore.log(this, "WARN", "No recent foreground app for " + renamed.file.getName());
+            AppStore.log(this, "WARN", "ATTRIBUTION", "No recent foreground app for " + renamed.file.getName());
         }
         routeByFilename(renamed.file);
     }
@@ -216,7 +314,7 @@ public class ScreenshotWatcherService extends Service {
     private void routeByFilename(File file) {
         AppStore.Rule rule = AppStore.findRuleForFilename(this, file.getName());
         if (rule == null) {
-            AppStore.log(this, "INFO", "No filename rule for " + file.getName());
+            AppStore.log(this, "INFO", "MOVE", "No filename rule for " + file.getName());
             return;
         }
         String label = rule.labelForFilename(file.getName());
@@ -232,16 +330,119 @@ public class ScreenshotWatcherService extends Service {
                     rule.nomedia,
                     System.currentTimeMillis()
             ));
-            AppStore.log(this, "QUEUED", label + ": " + file.getName() + " queued for " + rule.name);
+            AppStore.log(this, "QUEUED", "MOVE", label + ": " + file.getName() + " queued for " + rule.name);
             return;
         }
         ScreenshotMover.MoveResult result = ScreenshotMover.move(this, file.getAbsolutePath(), rule.destination, rule.nomedia);
         if (result.ok) {
             knownFiles.remove(file.getAbsolutePath());
-            AppStore.log(this, "MOVED", label + ": " + file.getName() + " -> " + rule.destination);
+            AppStore.log(this, "MOVED", "MOVE", label + ": " + file.getName() + " -> " + rule.destination);
         } else {
-            AppStore.log(this, "ERROR", "Move failed for " + file.getName() + ": " + result.error);
+            AppStore.log(this, "ERROR", "MOVE", "Move failed for " + file.getName() + ": " + result.error);
         }
+    }
+
+    private void scanRecentMediaStore() {
+        if (!running) {
+            return;
+        }
+        long afterSeconds = (System.currentTimeMillis() - MEDIASTORE_LOOKBACK_MS) / 1000L;
+        String[] projection = new String[]{
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DISPLAY_NAME,
+                MediaStore.Images.Media.DATA,
+                MediaStore.Images.Media.RELATIVE_PATH,
+                MediaStore.Images.Media.SIZE,
+                MediaStore.Images.Media.DATE_MODIFIED,
+                MediaStore.Images.Media.IS_PENDING
+        };
+        String selection = MediaStore.Images.Media.DATE_ADDED + ">=?";
+        String[] args = new String[]{String.valueOf(afterSeconds)};
+        String expectedRelative = sourceRelativePath();
+        int seen = 0;
+        try (Cursor cursor = getContentResolver().query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                args,
+                MediaStore.Images.Media.DATE_ADDED + " DESC")) {
+            if (cursor == null) {
+                AppStore.log(this, "WARN", "MEDIASTORE", "Query returned null");
+                return;
+            }
+            int idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID);
+            int nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME);
+            int dataCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATA);
+            int relCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.RELATIVE_PATH);
+            int sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE);
+            int modCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED);
+            int pendingCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.IS_PENDING);
+            while (cursor.moveToNext() && seen < 80) {
+                seen++;
+                String name = cursor.getString(nameCol);
+                if (name == null || !isScreenshotImage(name)) {
+                    continue;
+                }
+                if (!isOriginalSystemScreenshot(name)) {
+                    continue;
+                }
+                String relative = cursor.getString(relCol);
+                if (!relativeMatches(expectedRelative, relative)) {
+                    continue;
+                }
+                long size = cursor.getLong(sizeCol);
+                int pending = cursor.getInt(pendingCol);
+                if (pending != 0 || size <= 0) {
+                    continue;
+                }
+                long id = cursor.getLong(idCol);
+                String key = "media:" + id;
+                if (AppStore.hasProcessedScreenshot(this, key)) {
+                    continue;
+                }
+                File file = fileForMediaRow(cursor.getString(dataCol), relative, name);
+                Uri uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+                worker.postDelayed(() -> handleCandidate(file, uri, "mediastore", key), 700);
+            }
+        } catch (Exception e) {
+            AppStore.log(this, "ERROR", "MEDIASTORE", "Query failed: " + e.getMessage());
+        }
+    }
+
+    private File fileForMediaRow(String data, String relative, String name) {
+        if (data != null && !data.isEmpty()) {
+            return new File(data);
+        }
+        String base = AppStore.getSourceDir(this);
+        return new File(base, name);
+    }
+
+    private String sourceRelativePath() {
+        String source = AppStore.getSourceDir(this);
+        String external = android.os.Environment.getExternalStorageDirectory().getAbsolutePath();
+        if (source.startsWith(external)) {
+            String relative = source.substring(external.length());
+            while (relative.startsWith("/")) {
+                relative = relative.substring(1);
+            }
+            return relative.endsWith("/") ? relative : relative + "/";
+        }
+        if (source.startsWith("/sdcard/")) {
+            String relative = source.substring("/sdcard/".length());
+            return relative.endsWith("/") ? relative : relative + "/";
+        }
+        return "";
+    }
+
+    private boolean relativeMatches(String expected, String actual) {
+        if (expected.isEmpty()) {
+            return true;
+        }
+        return actual != null && expected.equals(actual);
+    }
+
+    private String processedKeyForFile(File file) {
+        return "file:" + file.getAbsolutePath() + ":" + file.lastModified() + ":" + file.length();
     }
 
     private List<File> listScreenshots() {
@@ -259,8 +460,15 @@ public class ScreenshotWatcherService extends Service {
     }
 
     private boolean isScreenshotImage(String name) {
+        if (name == null || name.startsWith(".")) {
+            return false;
+        }
         String lower = name.toLowerCase(Locale.US);
         return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp");
+    }
+
+    private boolean isOriginalSystemScreenshot(String name) {
+        return name != null && name.matches("(?i)Screenshot[_-]\\d{8}[-_]\\d{6}\\.(png|jpg|jpeg|webp)");
     }
 
     private boolean waitUntilStable(File file) {
@@ -279,6 +487,20 @@ public class ScreenshotWatcherService extends Service {
             }
         }
         return file.exists() && file.length() > 0;
+    }
+
+    private void promoteToForeground(String text) {
+        Notification notification = notification(text);
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else {
+                startForeground(NOTIFICATION_ID, notification);
+            }
+        } catch (RuntimeException e) {
+            AppStore.log(this, "ERROR", "SERVICE", "startForeground failed: " + e.getMessage());
+            startForeground(NOTIFICATION_ID, notification);
+        }
     }
 
     private void createChannel() {

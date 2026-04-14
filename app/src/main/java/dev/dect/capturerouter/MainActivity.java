@@ -44,6 +44,8 @@ import android.graphics.drawable.GradientDrawable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.io.File;
+import java.io.IOException;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -252,10 +254,14 @@ public class MainActivity extends Activity {
         logHeader.addView(sectionTitle("Activity log"), weightParams());
         Button clear = secondaryButton("Clear");
         clear.setOnClickListener(view -> {
-            AppStore.prefs(this).edit().putString(AppStore.KEY_LOGS, "[]").apply();
+            AppStore.clearLogs(this);
             refreshUi();
         });
         logHeader.addView(clear);
+        logHeader.addView(space(dp(8), 1));
+        Button export = secondaryButton("Export");
+        export.setOnClickListener(view -> exportDiagnostics());
+        logHeader.addView(export);
         logsCard.addView(logHeader);
         logsList = new LinearLayout(this);
         logsList.setOrientation(LinearLayout.VERTICAL);
@@ -352,7 +358,7 @@ public class MainActivity extends Activity {
         int count = Math.min(logs.size(), 30);
         for (int i = 0; i < count; i++) {
             AppStore.LogEntry entry = logs.get(i);
-            TextView line = text(AppStore.formatTime(entry.time) + "  " + entry.level + "\n" + entry.message,
+            TextView line = text(AppStore.formatTime(entry.time) + "  " + entry.level + "  " + entry.category + "\n" + entry.message,
                     13,
                     "ERROR".equals(entry.level) ? DANGER : INK,
                     Typeface.NORMAL);
@@ -1219,6 +1225,17 @@ public class MainActivity extends Activity {
                 .setMessage(message)
                 .setPositiveButton("OK", null)
                 .show();
+    }
+
+    private void exportDiagnostics() {
+        try {
+            File file = AppStore.writeDiagnostics(this);
+            AppStore.log(this, "INFO", "DIAGNOSTICS", "Diagnostics exported to " + file.getAbsolutePath());
+            showMessage("Diagnostics exported", file.getAbsolutePath());
+        } catch (IOException e) {
+            AppStore.log(this, "ERROR", "DIAGNOSTICS", "Diagnostics export failed: " + e.getMessage());
+            showMessage("Export failed", e.getMessage() == null ? "Could not write diagnostics." : e.getMessage());
+        }
     }
 
     private LinearLayout card() {

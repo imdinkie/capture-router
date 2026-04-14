@@ -10,7 +10,7 @@ public class BootReceiver extends BroadcastReceiver {
         if (AppStore.isMonitoringEnabled(context)) {
             WatchdogReceiver.schedule(context);
             ScreenshotWatcherService.start(context);
-            AppStore.log(context, "INFO", "Monitoring restored after " + intent.getAction());
+            AppStore.log(context, "INFO", "WATCHDOG", "Monitoring restored after " + intent.getAction());
         }
     }
 }
