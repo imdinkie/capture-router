@@ -33,12 +33,16 @@ final class AppStore {
     static final String KEY_FILENAME_TEMPLATE = "filename_template";
     static final String KEY_SOURCE_DIR = "source_dir";
     static final String KEY_PROCESSED = "processed_screenshots";
+    static final String KEY_SCREENSHOT_PATTERN_MODE = "screenshot_pattern_mode";
+    static final String PATTERN_PIXEL = "pixel";
+    static final String PATTERN_COMMON = "common";
+    static final String PATTERN_PERMISSIVE = "permissive";
     static final String DEFAULT_FILENAME_TEMPLATE = "Screenshot_{date}_{time}_{app}";
     static final String DEFAULT_SCREENSHOT_DIR = "/sdcard/Pictures/Screenshots";
-    private static final int MAX_LOGS = 200;
+    private static final int MAX_LOGS = 300;
     private static final int MAX_PENDING = 300;
     private static final int MAX_PROCESSED = 600;
-    private static final long MAX_DIAGNOSTIC_BYTES = 512 * 1024;
+    private static final long MAX_DIAGNOSTIC_BYTES = 2 * 1024 * 1024;
 
     private AppStore() {
     }
@@ -75,6 +79,30 @@ final class AppStore {
     static void setSourceDir(Context context, String path) {
         String clean = path == null ? "" : path.trim();
         prefs(context).edit().putString(KEY_SOURCE_DIR, clean.isEmpty() ? DEFAULT_SCREENSHOT_DIR : clean).apply();
+    }
+
+    static String getScreenshotPatternMode(Context context) {
+        String value = prefs(context).getString(KEY_SCREENSHOT_PATTERN_MODE, PATTERN_PIXEL);
+        if (PATTERN_COMMON.equals(value) || PATTERN_PERMISSIVE.equals(value)) {
+            return value;
+        }
+        return PATTERN_PIXEL;
+    }
+
+    static void setScreenshotPatternMode(Context context, String mode) {
+        String clean = PATTERN_COMMON.equals(mode) || PATTERN_PERMISSIVE.equals(mode) ? mode : PATTERN_PIXEL;
+        prefs(context).edit().putString(KEY_SCREENSHOT_PATTERN_MODE, clean).apply();
+    }
+
+    static String screenshotPatternModeLabel(Context context) {
+        String mode = getScreenshotPatternMode(context);
+        if (PATTERN_COMMON.equals(mode)) {
+            return "Common Android";
+        }
+        if (PATTERN_PERMISSIVE.equals(mode)) {
+            return "Permissive";
+        }
+        return "Pixel / AOSP";
     }
 
     static void setForegroundApp(Context context, String packageName, String label, long time) {
@@ -420,6 +448,7 @@ final class AppStore {
             writer.write("time=" + formatTime(System.currentTimeMillis()) + "\n");
             writer.write("monitoring=" + isMonitoringEnabled(context) + "\n");
             writer.write("sourceDir=" + getSourceDir(context) + "\n");
+            writer.write("screenshotPattern=" + screenshotPatternModeLabel(context) + " (" + getScreenshotPatternMode(context) + ")\n");
             writer.write("foreground=" + foregroundSummary(context) + "\n");
             writer.write("rules=" + getRules(context).size() + "\n");
             writer.write("pending=" + getPending(context).size() + "\n");

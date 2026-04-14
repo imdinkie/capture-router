@@ -15,6 +15,9 @@ import java.util.regex.Pattern;
 
 final class ScreenshotNamer {
     private static final Pattern PIXEL_TIMESTAMP = Pattern.compile("Screenshot[_-](\\d{8})[-_](\\d{6})$");
+    private static final Pattern COMMON_TIMESTAMP = Pattern.compile("(?i)Screen[Ss]hot[_ -]?(\\d{4})[-_](\\d{2})[-_](\\d{2})[-_](\\d{2})[-_](\\d{2})[-_](\\d{2})$");
+    private static final Pattern PERMISSIVE_SCREENSHOT = Pattern.compile("(?i)Screen[Ss]hot.*");
+    private static final Pattern DEFAULT_NAMED_SCREENSHOT = Pattern.compile("Screenshot_\\d{8}_\\d{6}_[A-Za-z].*");
     private static final Pattern EXTENSION = Pattern.compile("(?i)\\.(png|jpg|jpeg|webp)$");
 
     private ScreenshotNamer() {
@@ -28,10 +31,13 @@ final class ScreenshotNamer {
         String originalName = source.getName();
         String ext = extension(originalName);
         String originalBase = originalName.substring(0, originalName.length() - ext.length());
-        String appLabel = foreground == null ? "Unknown App" : foreground.label;
-        String packageName = foreground == null ? "unknown.app" : foreground.packageName;
+        if (foreground == null) {
+            return new RenameResult(source, "", "", "", false, "Rename skipped because no foreground app was available for " + originalName);
+        }
+        String appLabel = foreground.label;
+        String packageName = foreground.packageName;
         String appSlug = sanitizeLabel(appLabel);
-        if (!isOriginalSystemScreenshot(originalBase)) {
+        if (!isOriginalSystemScreenshot(context, originalName)) {
             return new RenameResult(source, appLabel, packageName, appSlug, false, "");
         }
 
@@ -80,14 +86,39 @@ final class ScreenshotNamer {
                 sanitizePackage(packageName), "Screenshot_20260411_194318") + ".png";
     }
 
-    private static boolean isOriginalSystemScreenshot(String base) {
-        return PIXEL_TIMESTAMP.matcher(base).matches();
+    static boolean isOriginalSystemScreenshot(Context context, String filename) {
+        if (filename == null) {
+            return false;
+        }
+        String ext = extension(filename);
+        if (ext.isEmpty()) {
+            return false;
+        }
+        String base = filename.substring(0, filename.length() - ext.length());
+        if (DEFAULT_NAMED_SCREENSHOT.matcher(base).matches()) {
+            return false;
+        }
+        String mode = AppStore.getScreenshotPatternMode(context);
+        if (PIXEL_TIMESTAMP.matcher(base).matches()) {
+            return true;
+        }
+        if (AppStore.PATTERN_COMMON.equals(mode) || AppStore.PATTERN_PERMISSIVE.equals(mode)) {
+            if (COMMON_TIMESTAMP.matcher(base).matches()) {
+                return true;
+            }
+        }
+        return AppStore.PATTERN_PERMISSIVE.equals(mode) && PERMISSIVE_SCREENSHOT.matcher(base).matches();
     }
 
     private static DateParts dateParts(String base, long modified) {
         Matcher matcher = PIXEL_TIMESTAMP.matcher(base);
         if (matcher.matches()) {
             return new DateParts(matcher.group(1), matcher.group(2));
+        }
+        matcher = COMMON_TIMESTAMP.matcher(base);
+        if (matcher.matches()) {
+            return new DateParts(matcher.group(1) + matcher.group(2) + matcher.group(3),
+                    matcher.group(4) + matcher.group(5) + matcher.group(6));
         }
         Date date = new Date(modified);
         return new DateParts(

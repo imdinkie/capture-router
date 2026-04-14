@@ -32,7 +32,7 @@ public class ScreenshotWatcherService extends Service {
     static final String ACTION_STOP = "dev.dect.capturerouter.STOP";
     private static final String CHANNEL_ID = "watcher";
     private static final int NOTIFICATION_ID = 7;
-    private static final long SCREENSHOT_RESCAN_MS = 30_000;
+    private static final long SCREENSHOT_RESCAN_MS = 60_000;
     private static final long ATTRIBUTION_WINDOW_MS = 20_000;
     private static final long MEDIASTORE_LOOKBACK_MS = 30 * 60 * 1000L;
 
@@ -159,7 +159,7 @@ public class ScreenshotWatcherService extends Service {
         observer = new FileObserver(dir.getAbsolutePath(), FileObserver.CREATE | FileObserver.MOVED_TO | FileObserver.CLOSE_WRITE) {
             @Override
             public void onEvent(int event, String path) {
-                if (path == null || !isScreenshotImage(path) || !isOriginalSystemScreenshot(path)) {
+                if (path == null || !isScreenshotImage(path) || !ScreenshotNamer.isOriginalSystemScreenshot(ScreenshotWatcherService.this, path)) {
                     return;
                 }
                 File file = new File(observedDir, path);
@@ -275,10 +275,14 @@ public class ScreenshotWatcherService extends Service {
         if (AppStore.hasProcessedScreenshot(this, processedKey)) {
             return;
         }
+        if (!ScreenshotNamer.isOriginalSystemScreenshot(this, file.getName())) {
+            AppStore.rememberProcessedScreenshot(this, processedKey);
+            routeAlreadyNamed(file);
+            return;
+        }
         AppStore.ForegroundApp foreground = AppStore.getRecentForegroundApp(this, ATTRIBUTION_WINDOW_MS);
-        if (foreground == null && isOriginalSystemScreenshot(file.getName())
-                && System.currentTimeMillis() - file.lastModified() > ATTRIBUTION_WINDOW_MS) {
-            AppStore.log(this, "WARN", "ATTRIBUTION", "Left stale screenshot unchanged because no recent foreground app was available trigger="
+        if (foreground == null) {
+            AppStore.log(this, "WARN", "ATTRIBUTION", "Left screenshot unchanged because no recent foreground app was available trigger="
                     + trigger + " file=" + file.getName());
             AppStore.rememberProcessedScreenshot(this, processedKey);
             return;
@@ -383,7 +387,7 @@ public class ScreenshotWatcherService extends Service {
                 if (name == null || !isScreenshotImage(name)) {
                     continue;
                 }
-                if (!isOriginalSystemScreenshot(name)) {
+                if (!ScreenshotNamer.isOriginalSystemScreenshot(this, name)) {
                     continue;
                 }
                 String relative = cursor.getString(relCol);
@@ -465,10 +469,6 @@ public class ScreenshotWatcherService extends Service {
         }
         String lower = name.toLowerCase(Locale.US);
         return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp");
-    }
-
-    private boolean isOriginalSystemScreenshot(String name) {
-        return name != null && name.matches("(?i)Screenshot[_-]\\d{8}[-_]\\d{6}\\.(png|jpg|jpeg|webp)");
     }
 
     private boolean waitUntilStable(File file) {

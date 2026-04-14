@@ -212,6 +212,12 @@ public class MainActivity extends Activity {
         Button sourceButton = secondaryButton("Change source folder");
         sourceButton.setOnClickListener(view -> showSourceFolderSettings());
         settingsCard.addView(sourceButton);
+        TextView patternHelp = text("Screenshot names: " + AppStore.screenshotPatternModeLabel(this), 13, MUTED, Typeface.NORMAL);
+        patternHelp.setPadding(0, dp(10), 0, dp(8));
+        settingsCard.addView(patternHelp);
+        Button patternButton = secondaryButton("Change screenshot name matching");
+        patternButton.setOnClickListener(view -> showScreenshotPatternSettings());
+        settingsCard.addView(patternButton);
         root.addView(settingsCard);
 
         LinearLayout rulesCard = card();
@@ -1187,6 +1193,73 @@ public class MainActivity extends Activity {
             });
         });
         dialog.show();
+    }
+
+    private void showScreenshotPatternSettings() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(12);
+        box.setPadding(pad, pad, pad, 0);
+        TextView help = text("Controls which new image names are treated as fresh screenshots. Keep the strict option unless another device uses different screenshot names.", 13, MUTED, Typeface.NORMAL);
+        help.setPadding(0, 0, 0, dp(8));
+        box.addView(help);
+        RadioGroup group = new RadioGroup(this);
+        group.setOrientation(RadioGroup.VERTICAL);
+        RadioButton pixel = new RadioButton(this);
+        pixel.setText("Pixel / AOSP");
+        pixel.setTextColor(INK);
+        pixel.setId(201);
+        RadioButton common = new RadioButton(this);
+        common.setText("Common Android");
+        common.setTextColor(INK);
+        common.setId(202);
+        RadioButton permissive = new RadioButton(this);
+        permissive.setText("Permissive");
+        permissive.setTextColor(INK);
+        permissive.setId(203);
+        group.addView(pixel);
+        group.addView(common);
+        group.addView(permissive);
+        String mode = AppStore.getScreenshotPatternMode(this);
+        group.check(AppStore.PATTERN_PERMISSIVE.equals(mode) ? 203
+                : AppStore.PATTERN_COMMON.equals(mode) ? 202 : 201);
+        box.addView(group);
+        TextView detail = text("", 13, ACCENT, Typeface.BOLD);
+        detail.setPadding(0, dp(8), 0, dp(8));
+        box.addView(detail);
+        group.setOnCheckedChangeListener((g, checkedId) -> {
+            if (checkedId == 202) {
+                detail.setText("Adds common hyphenated date/time screenshot names.");
+            } else if (checkedId == 203) {
+                detail.setText("Accepts image names starting with Screenshot or ScreenShot in the source folder.");
+            } else {
+                detail.setText("Matches Pixel-style screenshot names only.");
+            }
+        });
+        int checked = group.getCheckedRadioButtonId();
+        if (checked == 202) {
+            detail.setText("Adds common hyphenated date/time screenshot names.");
+        } else if (checked == 203) {
+            detail.setText("Accepts image names starting with Screenshot or ScreenShot in the source folder.");
+        } else {
+            detail.setText("Matches Pixel-style screenshot names only.");
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Screenshot name matching")
+                .setView(box)
+                .setPositiveButton("Save", (dialog, which) -> {
+                    int selected = group.getCheckedRadioButtonId();
+                    String next = selected == 203 ? AppStore.PATTERN_PERMISSIVE
+                            : selected == 202 ? AppStore.PATTERN_COMMON : AppStore.PATTERN_PIXEL;
+                    AppStore.setScreenshotPatternMode(this, next);
+                    AppStore.log(this, "INFO", "Screenshot name matching set to " + AppStore.screenshotPatternModeLabel(this));
+                    if (AppStore.isMonitoringEnabled(this)) {
+                        restartWatcherForSourceChange();
+                    }
+                    rebuildUi();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private boolean isValidSourceFolder(String path) {
