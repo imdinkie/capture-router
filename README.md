@@ -12,7 +12,8 @@ It is designed for sideloaded Android devices where the user wants local, transp
 - Supports single-app rules and app bundles.
 - Offers two routing modes:
   - **Auto move immediately** moves matching screenshots as soon as they are detected.
-  - **Queue for review** keeps screenshots visible until they are moved from CaptureRouter.
+  - **Queue for review** keeps screenshots visible until they are moved, skipped, or restored from the skipped list.
+- Keeps skipped and recovered screenshots reviewable when a matching review rule is active.
 - Creates `.nomedia` in destination folders by default so moved screenshots stay out of media galleries.
 - Provides a searchable app picker with icons and cached app loading.
 - Lets the source screenshot folder be changed from the default Android screenshots path.
@@ -120,4 +121,4 @@ Workflow:
 
 - Hidden folders plus `.nomedia` prevent normal gallery indexing, but they do not encrypt image bytes.
 - App attribution depends on Accessibility events near the screenshot timestamp. If Android withholds foreground state, screenshots may be named as `Unknown_App`.
-- Existing screenshots are only routed if their filenames already contain a matching app slug.
+- Existing screenshots are handled by filename: auto rules move matching files, and review rules surface matching files in the skipped review list when they were not already queued.

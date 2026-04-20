@@ -25,6 +25,7 @@ final class AppStore {
     static final String KEY_LOGS = "logs";
     static final String KEY_MONITORING = "monitoring";
     static final String KEY_PENDING = "pending";
+    static final String KEY_SKIPPED = "skipped";
     static final String KEY_FOREGROUND_PACKAGE = "foreground_package";
     static final String KEY_FOREGROUND_LABEL = "foreground_label";
     static final String KEY_FOREGROUND_TIME = "foreground_time";
@@ -41,6 +42,7 @@ final class AppStore {
     static final String DEFAULT_SCREENSHOT_DIR = "/sdcard/Pictures/Screenshots";
     private static final int MAX_LOGS = 300;
     private static final int MAX_PENDING = 300;
+    private static final int MAX_SKIPPED = 300;
     private static final int MAX_PROCESSED = 600;
     private static final long MAX_DIAGNOSTIC_BYTES = 2 * 1024 * 1024;
 
@@ -374,6 +376,207 @@ final class AppStore {
         return kept.size();
     }
 
+    static List<SkippedShot> getSkipped(Context context) {
+        ArrayList<SkippedShot> skipped = new ArrayList<>();
+        String raw = prefs(context).getString(KEY_SKIPPED, "[]");
+        try {
+            JSONArray array = new JSONArray(raw);
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject obj = array.getJSONObject(i);
+                SkippedShot shot = new SkippedShot(
+                        obj.optString("id"),
+                        obj.optString("path"),
+                        obj.optString("packageName"),
+                        obj.optString("label"),
+                        obj.optString("ruleId"),
+                        obj.optString("ruleName"),
+                        obj.optString("destination"),
+                        obj.optBoolean("nomedia", true),
+                        obj.optLong("time"),
+                        obj.optString("reason", SkippedShot.REASON_MANUAL)
+                );
+                if (!shot.id.isEmpty() && !shot.path.isEmpty()) {
+                    skipped.add(shot);
+                }
+            }
+        } catch (JSONException ignored) {
+        }
+        return skipped;
+    }
+
+    static void saveSkipped(Context context, List<SkippedShot> skipped) {
+        JSONArray array = new JSONArray();
+        int count = 0;
+        for (SkippedShot shot : skipped) {
+            if (count >= MAX_SKIPPED) {
+                break;
+            }
+            JSONObject obj = new JSONObject();
+            try {
+                obj.put("id", shot.id);
+                obj.put("path", shot.path);
+                obj.put("packageName", shot.packageName);
+                obj.put("label", shot.label);
+                obj.put("ruleId", shot.ruleId);
+                obj.put("ruleName", shot.ruleName);
+                obj.put("destination", shot.destination);
+                obj.put("nomedia", shot.nomedia);
+                obj.put("time", shot.time);
+                obj.put("reason", shot.reason);
+                array.put(obj);
+                count++;
+            } catch (JSONException ignored) {
+            }
+        }
+        prefs(context).edit().putString(KEY_SKIPPED, array.toString()).apply();
+    }
+
+    static void addSkipped(Context context, SkippedShot newShot) {
+        List<SkippedShot> skipped = getSkipped(context);
+        ArrayList<SkippedShot> kept = new ArrayList<>();
+        kept.add(newShot);
+        for (SkippedShot shot : skipped) {
+            if (!shot.path.equals(newShot.path) && new File(shot.path).exists()) {
+                kept.add(shot);
+            }
+        }
+        saveSkipped(context, kept);
+    }
+
+    static void removeSkipped(Context context, String skippedId) {
+        ArrayList<SkippedShot> kept = new ArrayList<>();
+        for (SkippedShot shot : getSkipped(context)) {
+            if (!shot.id.equals(skippedId)) {
+                kept.add(shot);
+            }
+        }
+        saveSkipped(context, kept);
+    }
+
+    static void skipPending(Context context, PendingShot shot) {
+        removePending(context, shot.id);
+        addSkipped(context, new SkippedShot(
+                "skipped-" + shot.id,
+                shot.path,
+                shot.packageName,
+                shot.label,
+                shot.ruleId,
+                shot.ruleName,
+                shot.destination,
+                shot.nomedia,
+                System.currentTimeMillis(),
+                SkippedShot.REASON_MANUAL
+        ));
+    }
+
+    static boolean restoreSkipped(Context context, SkippedShot shot) {
+        Rule rule = findRuleForFilename(context, new File(shot.path).getName());
+        if (rule == null || !Rule.MODE_MANUAL.equals(rule.mode) || !new File(shot.path).exists()) {
+            return false;
+        }
+        removeSkipped(context, shot.id);
+        addPending(context, new PendingShot(
+                "pending-" + new File(shot.path).lastModified() + "-" + new File(shot.path).getName(),
+                shot.path,
+                shot.packageName,
+                rule.labelForFilename(new File(shot.path).getName()),
+                rule.id,
+                rule.name,
+                rule.destination,
+                rule.nomedia,
+                System.currentTimeMillis()
+        ));
+        return true;
+    }
+
+    static int pruneMissingSkipped(Context context) {
+        List<SkippedShot> skipped = getSkipped(context);
+        ArrayList<SkippedShot> kept = new ArrayList<>();
+        for (SkippedShot shot : skipped) {
+            if (new File(shot.path).exists()) {
+                kept.add(shot);
+            }
+        }
+        if (kept.size() != skipped.size()) {
+            saveSkipped(context, kept);
+        }
+        return kept.size();
+    }
+
+    static int removeItemsForRule(Context context, String ruleId) {
+        int removed = 0;
+        ArrayList<PendingShot> pendingKept = new ArrayList<>();
+        for (PendingShot shot : getPending(context)) {
+            if (shot.ruleId.equals(ruleId)) {
+                removed++;
+            } else {
+                pendingKept.add(shot);
+            }
+        }
+        ArrayList<SkippedShot> skippedKept = new ArrayList<>();
+        for (SkippedShot shot : getSkipped(context)) {
+            if (shot.ruleId.equals(ruleId)) {
+                removed++;
+            } else {
+                skippedKept.add(shot);
+            }
+        }
+        savePending(context, pendingKept);
+        saveSkipped(context, skippedKept);
+        return removed;
+    }
+
+    static boolean hasPendingOrSkippedPath(Context context, String path) {
+        if (path == null || path.isEmpty()) {
+            return false;
+        }
+        for (PendingShot shot : getPending(context)) {
+            if (path.equals(shot.path)) {
+                return true;
+            }
+        }
+        for (SkippedShot shot : getSkipped(context)) {
+            if (path.equals(shot.path)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static int reconcileRecoveredSkipped(Context context) {
+        int added = 0;
+        pruneMissingPending(context);
+        pruneMissingSkipped(context);
+        File dir = new File(getSourceDir(context));
+        File[] files = dir.listFiles(file -> file.isFile() && isScreenshotImage(file.getName()));
+        if (files == null) {
+            return 0;
+        }
+        for (File file : files) {
+            Rule rule = findRuleForFilename(context, file.getName());
+            if (rule == null || !Rule.MODE_MANUAL.equals(rule.mode)) {
+                continue;
+            }
+            if (hasPendingOrSkippedPath(context, file.getAbsolutePath())) {
+                continue;
+            }
+            addSkipped(context, new SkippedShot(
+                    "skipped-recovered-" + file.lastModified() + "-" + file.getName(),
+                    file.getAbsolutePath(),
+                    "",
+                    rule.labelForFilename(file.getName()),
+                    rule.id,
+                    rule.name,
+                    rule.destination,
+                    rule.nomedia,
+                    System.currentTimeMillis(),
+                    SkippedShot.REASON_RECOVERED
+            ));
+            added++;
+        }
+        return added;
+    }
+
     static List<LogEntry> getLogs(Context context) {
         ArrayList<LogEntry> logs = new ArrayList<>();
         String raw = prefs(context).getString(KEY_LOGS, "[]");
@@ -452,6 +655,7 @@ final class AppStore {
             writer.write("foreground=" + foregroundSummary(context) + "\n");
             writer.write("rules=" + getRules(context).size() + "\n");
             writer.write("pending=" + getPending(context).size() + "\n");
+            writer.write("skipped=" + getSkipped(context).size() + "\n");
             writer.write("processedLedger=" + processedKeys(context).size() + "\n\n");
             writer.write("Recent in-app log\n");
             for (LogEntry entry : getLogs(context)) {
@@ -576,6 +780,14 @@ final class AppStore {
             return Log.WARN;
         }
         return Log.INFO;
+    }
+
+    private static boolean isScreenshotImage(String name) {
+        if (name == null || name.startsWith(".")) {
+            return false;
+        }
+        String lower = name.toLowerCase(Locale.US);
+        return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp");
     }
 
     static String defaultDestination(String label, String packageName) {
@@ -713,6 +925,43 @@ final class AppStore {
             this.destination = destination;
             this.nomedia = nomedia;
             this.time = time;
+        }
+    }
+
+    static final class SkippedShot {
+        static final String REASON_MANUAL = "manual_skip";
+        static final String REASON_RECOVERED = "recovered_filename";
+
+        final String id;
+        final String path;
+        final String packageName;
+        final String label;
+        final String ruleId;
+        final String ruleName;
+        final String destination;
+        final boolean nomedia;
+        final long time;
+        final String reason;
+
+        SkippedShot(String id, String path, String packageName, String label, String ruleId,
+                    String ruleName, String destination, boolean nomedia, long time, String reason) {
+            this.id = id == null || id.isEmpty() ? "skipped-" + System.currentTimeMillis() : id;
+            this.path = path;
+            this.packageName = packageName;
+            this.label = label == null || label.isEmpty() ? packageName : label;
+            this.ruleId = ruleId;
+            this.ruleName = ruleName;
+            this.destination = destination;
+            this.nomedia = nomedia;
+            this.time = time;
+            this.reason = REASON_RECOVERED.equals(reason) ? REASON_RECOVERED : REASON_MANUAL;
+        }
+
+        String reasonLabel() {
+            if (REASON_RECOVERED.equals(reason)) {
+                return "Recovered from filename";
+            }
+            return "Skipped for now";
         }
     }
 

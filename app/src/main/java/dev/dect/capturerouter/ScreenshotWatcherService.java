@@ -309,10 +309,34 @@ public class ScreenshotWatcherService extends Service {
 
     private void routeAlreadyNamed(File file) {
         AppStore.Rule rule = AppStore.findRuleForFilename(this, file.getName());
-        if (rule == null || AppStore.Rule.MODE_MANUAL.equals(rule.mode)) {
+        if (rule == null) {
+            return;
+        }
+        if (AppStore.Rule.MODE_MANUAL.equals(rule.mode)) {
+            addRecoveredSkipped(file, rule);
             return;
         }
         routeByFilename(file);
+    }
+
+    private void addRecoveredSkipped(File file, AppStore.Rule rule) {
+        if (AppStore.hasPendingOrSkippedPath(this, file.getAbsolutePath())) {
+            return;
+        }
+        String label = rule.labelForFilename(file.getName());
+        AppStore.addSkipped(this, new AppStore.SkippedShot(
+                "skipped-recovered-" + file.lastModified() + "-" + file.getName(),
+                file.getAbsolutePath(),
+                "",
+                label,
+                rule.id,
+                rule.name,
+                rule.destination,
+                rule.nomedia,
+                System.currentTimeMillis(),
+                AppStore.SkippedShot.REASON_RECOVERED
+        ));
+        AppStore.log(this, "INFO", "MOVE", label + ": " + file.getName() + " recovered for skipped review");
     }
 
     private void routeByFilename(File file) {

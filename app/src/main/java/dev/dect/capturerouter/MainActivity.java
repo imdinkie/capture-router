@@ -73,16 +73,20 @@ public class MainActivity extends Activity {
     private TextView sourceText;
     private LinearLayout rulesList;
     private LinearLayout pendingList;
+    private LinearLayout skippedList;
     private LinearLayout logsList;
     private Button monitorButton;
     private Button addRuleButton;
     private Button moveSelectedButton;
+    private Button moveSelectedSkippedButton;
     private AlertDialog appLoadingDialog;
     private AlertDialog appPickerDialog;
     private ArrayList<AppInfo> appCache;
     private boolean appPickerLoading;
     private int appPickerRequestToken;
+    private long lastSkippedRecoveryScan;
     private final HashSet<String> selectedPendingIds = new HashSet<>();
+    private final HashSet<String> selectedSkippedIds = new HashSet<>();
 
     private final Runnable refreshRunnable = new Runnable() {
         @Override
@@ -254,6 +258,22 @@ public class MainActivity extends Activity {
         pendingCard.addView(pendingList);
         root.addView(pendingCard);
 
+        LinearLayout skippedCard = card();
+        LinearLayout skippedHeader = row();
+        skippedHeader.setGravity(Gravity.CENTER_VERTICAL);
+        skippedHeader.addView(sectionTitle("Skipped screenshots"), weightParams());
+        moveSelectedSkippedButton = secondaryButton("Move selected");
+        moveSelectedSkippedButton.setOnClickListener(view -> moveSelectedSkipped());
+        skippedHeader.addView(moveSelectedSkippedButton);
+        skippedCard.addView(skippedHeader);
+        TextView skippedHelp = text("Skipped and recovered screenshots stay reviewable here until you restore or move them.", 14, MUTED, Typeface.NORMAL);
+        skippedHelp.setPadding(0, 0, 0, dp(10));
+        skippedCard.addView(skippedHelp);
+        skippedList = new LinearLayout(this);
+        skippedList.setOrientation(LinearLayout.VERTICAL);
+        skippedCard.addView(skippedList);
+        root.addView(skippedCard);
+
         LinearLayout logsCard = card();
         LinearLayout logHeader = row();
         logHeader.setGravity(Gravity.CENTER_VERTICAL);
@@ -301,9 +321,23 @@ public class MainActivity extends Activity {
         monitorButton.setText(monitoring ? "Stop monitoring" : "Start monitoring");
         monitorButton.setBackground(buttonBg(monitoring ? DANGER : ACCENT));
         updateAppPickerButton();
+        reconcileSkippedRecovery();
         renderRules();
         renderPending();
+        renderSkipped();
         renderLogs();
+    }
+
+    private void reconcileSkippedRecovery() {
+        long now = System.currentTimeMillis();
+        if (now - lastSkippedRecoveryScan < 15_000) {
+            return;
+        }
+        lastSkippedRecoveryScan = now;
+        int added = AppStore.reconcileRecoveredSkipped(this);
+        if (added > 0) {
+            AppStore.log(this, "INFO", "MOVE", "Recovered " + added + " skipped screenshot" + (added == 1 ? "" : "s"));
+        }
     }
 
     private void renderRules() {
@@ -342,8 +376,10 @@ public class MainActivity extends Activity {
             Button remove = secondaryButton("Remove");
             remove.setTextColor(DANGER);
             remove.setOnClickListener(view -> {
+                int removedItems = AppStore.removeItemsForRule(this, rule.id);
                 AppStore.removeRule(this, rule.id);
-                AppStore.log(this, "INFO", "Removed rule " + rule.name);
+                AppStore.log(this, "INFO", "Removed rule " + rule.name
+                        + (removedItems == 0 ? "" : " and cleared " + removedItems + " queued/skipped item" + (removedItems == 1 ? "" : "s")));
                 refreshUi();
             });
             actions.addView(edit);
@@ -424,15 +460,16 @@ public class MainActivity extends Activity {
             actions.setPadding(0, dp(8), 0, 0);
             Button move = primaryButton("Move now");
             move.setOnClickListener(view -> movePending(shot));
-            Button forget = secondaryButton("Forget");
-            forget.setOnClickListener(view -> {
-                AppStore.removePending(this, shot.id);
-                AppStore.log(this, "INFO", "Forgot queued screenshot " + new java.io.File(shot.path).getName());
+            Button skip = secondaryButton("Skip");
+            skip.setOnClickListener(view -> {
+                AppStore.skipPending(this, shot);
+                selectedPendingIds.remove(shot.id);
+                AppStore.log(this, "INFO", "Skipped queued screenshot " + new java.io.File(shot.path).getName());
                 refreshUi();
             });
             actions.addView(move);
             actions.addView(space(dp(8), 1));
-            actions.addView(forget);
+            actions.addView(skip);
             item.addView(actions);
             pendingList.addView(item);
         }
@@ -451,6 +488,19 @@ public class MainActivity extends Activity {
                 + ": " + join(parts, ", ") + suffix;
     }
 
+    private String skippedSummary(int total, LinkedHashMap<String, Integer> grouped) {
+        ArrayList<String> parts = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : grouped.entrySet()) {
+            parts.add(entry.getKey() + " (" + entry.getValue() + ")");
+            if (parts.size() == 3) {
+                break;
+            }
+        }
+        String suffix = grouped.size() > 3 ? " +" + (grouped.size() - 3) + " more" : "";
+        return total + " skipped across " + grouped.size() + " rule" + (grouped.size() == 1 ? "" : "s")
+                + ": " + join(parts, ", ") + suffix;
+    }
+
     private void updateMoveSelectedButton() {
         if (moveSelectedButton == null) {
             return;
@@ -458,6 +508,72 @@ public class MainActivity extends Activity {
         int count = selectedPendingIds.size();
         moveSelectedButton.setText(count == 0 ? "Move selected" : "Move selected (" + count + ")");
         moveSelectedButton.setEnabled(count > 0);
+    }
+
+    private void renderSkipped() {
+        if (skippedList == null) {
+            return;
+        }
+        AppStore.pruneMissingSkipped(this);
+        skippedList.removeAllViews();
+        List<AppStore.SkippedShot> skipped = AppStore.getSkipped(this);
+        if (skipped.isEmpty()) {
+            selectedSkippedIds.clear();
+            updateMoveSelectedSkippedButton();
+            skippedList.addView(text("No skipped screenshots.", 14, MUTED, Typeface.NORMAL));
+            return;
+        }
+        HashSet<String> existing = new HashSet<>();
+        LinkedHashMap<String, Integer> grouped = new LinkedHashMap<>();
+        for (AppStore.SkippedShot shot : skipped) {
+            existing.add(shot.id);
+            Integer count = grouped.get(shot.ruleName);
+            grouped.put(shot.ruleName, count == null ? 1 : count + 1);
+        }
+        selectedSkippedIds.retainAll(existing);
+        updateMoveSelectedSkippedButton();
+        TextView summary = text(skippedSummary(skipped.size(), grouped), 13, MUTED, Typeface.BOLD);
+        summary.setPadding(0, 0, 0, dp(8));
+        skippedList.addView(summary);
+        for (AppStore.SkippedShot shot : skipped) {
+            LinearLayout item = itemBox();
+            LinearLayout titleRow = row();
+            CheckBox selected = new CheckBox(this);
+            selected.setChecked(selectedSkippedIds.contains(shot.id));
+            selected.setOnCheckedChangeListener((buttonView, checked) -> {
+                if (checked) {
+                    selectedSkippedIds.add(shot.id);
+                } else {
+                    selectedSkippedIds.remove(shot.id);
+                }
+                updateMoveSelectedSkippedButton();
+            });
+            titleRow.addView(selected);
+            titleRow.addView(text(shot.label, 15, INK, Typeface.BOLD), weightParams());
+            item.addView(titleRow);
+            item.addView(text(shot.reasonLabel() + " • " + shot.ruleName + " • " + AppStore.formatTime(shot.time), 13, ACCENT, Typeface.BOLD));
+            item.addView(text(new java.io.File(shot.path).getName(), 13, MUTED, Typeface.NORMAL));
+            LinearLayout actions = row();
+            actions.setPadding(0, dp(8), 0, 0);
+            Button move = primaryButton("Move now");
+            move.setOnClickListener(view -> moveSkipped(shot));
+            Button restore = secondaryButton("Restore");
+            restore.setOnClickListener(view -> restoreSkipped(shot));
+            actions.addView(move);
+            actions.addView(space(dp(8), 1));
+            actions.addView(restore);
+            item.addView(actions);
+            skippedList.addView(item);
+        }
+    }
+
+    private void updateMoveSelectedSkippedButton() {
+        if (moveSelectedSkippedButton == null) {
+            return;
+        }
+        int count = selectedSkippedIds.size();
+        moveSelectedSkippedButton.setText(count == 0 ? "Move selected" : "Move selected (" + count + ")");
+        moveSelectedSkippedButton.setEnabled(count > 0);
     }
 
     private void moveAllPending() {
@@ -552,6 +668,79 @@ public class MainActivity extends Activity {
                 refreshUi();
             });
         }, "move-one-pending").start();
+    }
+
+    private void moveSelectedSkipped() {
+        if (selectedSkippedIds.isEmpty()) {
+            showMessage("Nothing selected", "Select one or more skipped screenshots first.");
+            return;
+        }
+        List<AppStore.SkippedShot> skipped = AppStore.getSkipped(this);
+        ArrayList<AppStore.SkippedShot> selected = new ArrayList<>();
+        for (AppStore.SkippedShot shot : skipped) {
+            if (selectedSkippedIds.contains(shot.id)) {
+                selected.add(shot);
+            }
+        }
+        if (selected.isEmpty()) {
+            selectedSkippedIds.clear();
+            refreshUi();
+            return;
+        }
+        new Thread(() -> {
+            int moved = 0;
+            int failed = 0;
+            for (AppStore.SkippedShot shot : selected) {
+                if (!new java.io.File(shot.path).exists()) {
+                    AppStore.removeSkipped(this, shot.id);
+                    continue;
+                }
+                ScreenshotMover.MoveResult result = ScreenshotMover.move(this, shot.path, shot.destination, shot.nomedia);
+                if (result.ok) {
+                    moved++;
+                    AppStore.removeSkipped(this, shot.id);
+                    AppStore.log(this, "MOVED", shot.label + ": " + new java.io.File(shot.path).getName() + " -> " + shot.destination);
+                } else {
+                    failed++;
+                    AppStore.log(this, "ERROR", "Skipped move failed for " + new java.io.File(shot.path).getName() + ": " + result.error);
+                }
+            }
+            int finalMoved = moved;
+            int finalFailed = failed;
+            refreshHandler.post(() -> {
+                selectedSkippedIds.clear();
+                refreshUi();
+                showMessage("Selection processed", finalMoved + " moved, " + finalFailed + " failed.");
+            });
+        }, "move-selected-skipped").start();
+    }
+
+    private void moveSkipped(AppStore.SkippedShot shot) {
+        new Thread(() -> {
+            ScreenshotMover.MoveResult result = ScreenshotMover.move(this, shot.path, shot.destination, shot.nomedia);
+            refreshHandler.post(() -> {
+                if (result.ok) {
+                    selectedSkippedIds.remove(shot.id);
+                    AppStore.removeSkipped(this, shot.id);
+                    AppStore.log(this, "MOVED", shot.label + ": " + new java.io.File(shot.path).getName() + " -> " + shot.destination);
+                } else {
+                    AppStore.log(this, "ERROR", "Skipped move failed for " + new java.io.File(shot.path).getName() + ": " + result.error);
+                    showMessage("Move failed", result.error.isEmpty() ? "The destination is not writable." : result.error);
+                }
+                refreshUi();
+            });
+        }, "move-one-skipped").start();
+    }
+
+    private void restoreSkipped(AppStore.SkippedShot shot) {
+        if (AppStore.restoreSkipped(this, shot)) {
+            selectedSkippedIds.remove(shot.id);
+            AppStore.log(this, "INFO", "Restored skipped screenshot " + new java.io.File(shot.path).getName());
+            refreshUi();
+            return;
+        }
+        showMessage("Cannot restore", "The file is missing or no active review rule matches this screenshot.");
+        refreshUi();
     }
 
     private void toggleMonitoring() {
